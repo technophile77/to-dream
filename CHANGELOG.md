@@ -2,6 +2,14 @@
 
 All notable changes to to-dream are recorded here. Versions follow [semver](https://semver.org/); the source of truth is `version` in `plugins/to-dream/.claude-plugin/plugin.json`.
 
+## 0.1.2 - 2026-11-03
+
+Fix: auto-update instructions only worked in the terminal.
+
+- The `/plugin` → Marketplaces → Enable auto-update toggle exists only in the terminal version of Claude Code, not the VS Code extension. The README, `/to-dream:setup` and the update reminder now also describe the client-independent route: `extraKnownMarketplaces.to-dream.autoUpdate` in `~/.claude/settings.json`.
+- `/to-dream:setup` offers to add that settings entry for you.
+- The one-line update reminder now points to the README's Updating section instead of naming the terminal toggle.
+
 ## 0.1.1 - 2026-11-03
 
 Fix macOS/Linux: project ids starting with "-".

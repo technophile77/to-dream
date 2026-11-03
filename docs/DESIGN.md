@@ -79,10 +79,10 @@ Background auto-update is off by default for third-party marketplaces, so to-dre
 - **`to-dream check-update [--json] [--force]`** compares the running version with the latest published one. It reads `plugin.json` from the default branch over HTTPS, using a raw URL derived from the `repository` field in the running plugin's `plugin.json`, with a 5-second timeout. The result is cached in `$TO_DREAM_HOME/update-check.json` for 24 hours, and `--force` bypasses the cache. It never fails a command: when offline, or on any error, it reports `unknown` and exits 0. The JSON form is `{current, latest, update_available, checked_at, changelog_url}`, and versions are compared as semver.
 - **Opting out.** Set `config.json` `update_check: false` or the env var `TO_DREAM_NO_UPDATE_CHECK=1`.
 - **Where users see it.**
-  - Every `/to-dream:*` skill runs `check-update --json` right after `sync-runtime`. When an update is available, the skill shows one line before doing anything else, for example: "to-dream 0.3.0 is out (you have 0.2.1). Update: `/plugin marketplace update to-dream`, then `/reload-plugins`. To stop needing this, turn on auto-update under `/plugin` → Marketplaces → to-dream." It then carries on.
+  - Every `/to-dream:*` skill runs `check-update --json` right after `sync-runtime`. When an update is available, the skill shows one line before doing anything else, for example: "to-dream 0.3.0 is out (you have 0.2.1). Update: `/plugin marketplace update to-dream`, then `/reload-plugins`. To update automatically, see https://github.com/technophile77/to-dream#updating." It then carries on.
   - The nightly run writes the same notice to its log and records it in `state.json`, so `/to-dream:review` shows it at the start of the next review even if the cached check is stale.
   - `doctor` includes the update status as one of its checks.
-  - `/to-dream:setup` offers to turn on auto-update as its last step, and explains how.
+  - `/to-dream:setup` offers to turn on auto-update as its last step. It can add the `extraKnownMarketplaces` `autoUpdate` entry to `~/.claude/settings.json` (works in every client, including VS Code), or point to the terminal-only `/plugin` toggle.
 - **Runtime sync after an update.** The version stamp in `$TO_DREAM_HOME/runtime/VERSION` lets `sync-runtime` notice that the plugin was updated and refresh the copy the scheduled job uses.
 
 ## Safety rules

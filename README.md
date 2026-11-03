@@ -111,7 +111,24 @@ Background auto-update is **off by default** for third-party marketplaces. To up
 /reload-plugins
 ```
 
-or `claude plugin update to-dream@to-dream` from a terminal. To turn on auto-update: `/plugin` → Marketplaces → to-dream → Enable auto-update.
+or `claude plugin update to-dream@to-dream` from a terminal.
+
+To turn on auto-update, pick one:
+
+- **Any client, including the VS Code extension:** add this to `~/.claude/settings.json`:
+
+  ```json
+  "extraKnownMarketplaces": {
+    "to-dream": {
+      "source": { "source": "github", "repo": "technophile77/to-dream" },
+      "autoUpdate": true
+    }
+  }
+  ```
+
+- **Terminal only:** run `claude`, then `/plugin` → Marketplaces → to-dream → Enable auto-update. This toggle exists only in the terminal version of Claude Code; the VS Code plugin panel doesn't have it.
+
+`/to-dream:setup` can add the settings entry for you.
 
 to-dream also reminds you: each `/to-dream:*` skill checks (at most once a day) whether a newer release is published and shows a one-line note; the nightly run records it so `/to-dream:review` shows it too. `to-dream doctor` includes the status. To switch the check off, run `to-dream config set update_check false` or set `TO_DREAM_NO_UPDATE_CHECK=1`. The check only fetches `plugin.json` from this repository on GitHub and sends nothing else.
 

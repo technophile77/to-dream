@@ -296,6 +296,18 @@ class ReminderTests(unittest.TestCase):
         self.assertIn("/plugin marketplace update to-dream", line)
         self.assertIn("/reload-plugins", line)
 
+    def test_reminder_line_points_to_readme_updating_and_not_the_terminal_toggle(self):
+        line = update.reminder_line({"update_available": True, "latest": "0.3.0", "current": "0.2.1",
+                                     "changelog_url": "https://github.com/acme/widget/blob/HEAD/CHANGELOG.md"})
+        self.assertIn("see https://github.com/acme/widget#updating.", line)
+        self.assertNotIn("Marketplaces", line)
+        self.assertNotIn("\n", line)
+
+    def test_reminder_line_falls_back_without_a_repository_url(self):
+        line = update.reminder_line({"update_available": True, "latest": "0.3.0", "current": "0.2.1"})
+        self.assertIn("see the README's Updating section.", line)
+        self.assertNotIn("#updating", line)
+
     def test_no_reminder_when_up_to_date(self):
         self.assertEqual(update.reminder_line({"update_available": False}), "")
 
