@@ -57,7 +57,7 @@ to-dream/                                  # repo = marketplace
 | `reject-suggestion <run-id> --text TEXT [--reason TEXT]` | Log a rejected global CLAUDE.md suggestion in `rejected.md`. |
 | `discard <run-id> [--force]` | Remove the worktree and branch, and log leftover undecided changes as rejected. |
 | `schedule install [--time HH:MM] \| remove \| status [--json]` | Set up the nightly run of `run --project all`, catching up after a missed start. Windows uses Task Scheduler (`schtasks` plus StartWhenAvailable). macOS uses a launchd LaunchAgent with StartCalendarInterval. Linux uses a systemd user timer with `Persistent=true`, or crontab if systemd isn't available. |
-| `sync-runtime` | Copy the runtime into `$TO_DREAM_HOME/runtime` and print its path. |
+| `sync-runtime [--force]` | Copy the runtime into `$TO_DREAM_HOME/runtime` and print its path (stdout is only the path). Never downgrades: if the runtime's version is newer than this plugin's, it is left as is, one note goes to stderr and the exit code stays 0. `--force` overwrites it anyway (rollback). |
 | `config show \| get KEY \| set KEY VALUE` | Read or change `config.json`. |
 
 ### Config keys (`config.json`, all optional)
@@ -83,7 +83,7 @@ Background auto-update is off by default for third-party marketplaces, so to-dre
   - The nightly run writes the same notice to its log and records it in `state.json`, so `/to-dream:review` shows it at the start of the next review even if the cached check is stale.
   - `doctor` includes the update status as one of its checks.
   - `/to-dream:setup` offers to turn on auto-update as its last step. It can add the `extraKnownMarketplaces` `autoUpdate` entry to `~/.claude/settings.json` (works in every client, including VS Code), or point to the terminal-only `/plugin` toggle.
-- **Runtime sync after an update.** The version stamp in `$TO_DREAM_HOME/runtime/VERSION` lets `sync-runtime` notice that the plugin was updated and refresh the copy the scheduled job uses.
+- **Runtime sync after an update.** The version stamp in `$TO_DREAM_HOME/runtime/VERSION` lets `sync-runtime` notice that the plugin was updated and refresh the copy the scheduled job uses. It only moves forward: when two Claude Code sessions run different plugin versions, the older session leaves a newer runtime alone (and `doctor` warns with the update hint). Same-version content differences still refresh, and `sync-runtime --force` allows a deliberate downgrade.
 
 ## Safety rules
 - The headless Claude gets `--allowedTools Read Glob Grep Agent` plus read-only `Read(...)` rules for the project source, `CLAUDE.md`, the steering file and `rejected.md`. It runs with `--disallowedTools Bash PowerShell WebFetch WebSearch`, `--permission-mode acceptEdits` (so edits are allowed only in its cwd, the worktree), `--permission-prompts none` and `--no-session-persistence`, with `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.

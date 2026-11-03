@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from td_testing import IsolatedHomeTestCase
+from test_runtime import FakePlugin
 
 from to_dream import doctor, repo_setup
 
@@ -53,6 +54,25 @@ class CheckTests(IsolatedHomeTestCase):
         newer = doctor.check_update({**base, "latest": "0.2.0", "update_available": True, "status": "ok"})
         self.assertEqual(newer.status, "warn")
         self.assertIn("/plugin marketplace update to-dream", newer.fix)
+
+    def _runtime_check(self, runtime_version, plugin_version):
+        plugin = FakePlugin(self.tmp / ("plugin-" + plugin_version), plugin_version)
+        (self.home / "runtime").mkdir()
+        (self.home / "runtime" / "VERSION").write_text(runtime_version + "\n")
+        with mock.patch.object(doctor.version, "ROOT", plugin.root):
+            return doctor.check_runtime()
+
+    def test_runtime_newer_than_plugin_warns_with_update_hint(self):
+        check = self._runtime_check("0.1.2", "0.1.1")
+        self.assertEqual(check.status, "warn")
+        self.assertIn("0.1.2", check.detail)
+        self.assertIn("0.1.1", check.detail)
+        self.assertIn("/plugin marketplace update to-dream", check.fix)
+        self.assertIn("/reload-plugins", check.fix)
+
+    def test_runtime_older_than_plugin_still_suggests_sync(self):
+        check = self._runtime_check("0.1.0", "0.1.1")
+        self.assertEqual((check.status, check.fix), ("warn", "Run `to-dream sync-runtime`."))
 
     def test_schedule_statuses(self):
         self.assertEqual(doctor.check_schedule({"installed": False}).status, "warn")

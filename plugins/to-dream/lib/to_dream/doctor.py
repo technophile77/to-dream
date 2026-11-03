@@ -97,6 +97,12 @@ def check_runtime() -> Check:
         return Check("runtime", WARN, "no runtime copy yet", "Run `to-dream sync-runtime`.")
     if version.ROOT.resolve() == target.resolve() or runtime.is_current(version.ROOT, target):
         return Check("runtime", OK, "%s (version %s)" % (target, version.current_version(target)))
+    newer = runtime.newer_runtime(version.ROOT, target)
+    if newer is not None:
+        return Check("runtime", WARN,
+                     "runtime copy is %s, newer than this plugin (%s)" % (newer, version.current_version(version.ROOT)),
+                     "Run `/plugin marketplace update to-dream`, then `/reload-plugins`. "
+                     "`to-dream sync-runtime --force` downgrades the runtime on purpose.")
     return Check("runtime", WARN, "runtime copy is out of date", "Run `to-dream sync-runtime`.")
 
 
