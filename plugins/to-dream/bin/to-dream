@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# to-dream launcher: finds a Python >= 3.10, resolves the state directory and
+# runs scripts/to_dream.py next to this file. Must keep LF line endings.
+#
+# TO_DREAM_HOME precedence: an already-exported TO_DREAM_HOME, then
+# CLAUDE_PLUGIN_DATA (when Claude Code exports it), then ~/.claude/to-dream.
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Native Windows Python can't read MSYS-style (/e/...) paths; use the mixed form there.
+if here_w="$(cd "$here" && pwd -W 2>/dev/null)"; then
+  here="$here_w"
+fi
+
+if [ -z "${TO_DREAM_HOME:-}" ]; then
+  if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+    TO_DREAM_HOME="$CLAUDE_PLUGIN_DATA"
+  else
+    TO_DREAM_HOME="$HOME/.claude/to-dream"
+  fi
+fi
+export TO_DREAM_HOME
+export PYTHONUTF8=1
+
+python_cmd=""
+for candidate in python3 python "py -3"; do
+  # shellcheck disable=SC2086  # "py -3" is intentionally word-split
+  if $candidate -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+    python_cmd="$candidate"
+    break
+  fi
+done
+
+if [ -z "$python_cmd" ]; then
+  echo "to-dream: Python 3.10 or newer was not found on PATH (tried python3, python, py -3)." >&2
+  echo "Install Python 3.10+ from https://www.python.org/downloads/ and try again." >&2
+  exit 127
+fi
+
+# shellcheck disable=SC2086
+exec $python_cmd "$here/../scripts/to_dream.py" "$@"

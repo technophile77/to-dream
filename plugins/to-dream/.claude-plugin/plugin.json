@@ -1,0 +1,12 @@
+{
+  "name": "to-dream",
+  "version": "0.1.0",
+  "description": "Out-of-band memory consolidation (\"dreaming\") for Claude Code auto memory: distils your session transcripts, finds repeated mistakes and stale memories, and proposes changes you review and accept.",
+  "author": {
+    "name": "Alex Cresswell"
+  },
+  "repository": "https://github.com/technophile77/to-dream",
+  "homepage": "https://github.com/technophile77/to-dream",
+  "license": "MIT",
+  "keywords": ["memory", "dreaming", "auto-memory", "consolidation", "claude-code"]
+}

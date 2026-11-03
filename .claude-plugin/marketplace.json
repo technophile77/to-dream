@@ -1,0 +1,14 @@
+{
+  "name": "to-dream",
+  "owner": {
+    "name": "Alex Cresswell"
+  },
+  "description": "Marketplace for to-dream, a Claude Code plugin that consolidates auto memory offline (\"dreaming\") and proposes reviewed changes.",
+  "plugins": [
+    {
+      "name": "to-dream",
+      "source": "./plugins/to-dream",
+      "description": "Out-of-band memory consolidation (\"dreaming\") for Claude Code auto memory: finds patterns across sessions and proposes memory changes you review and accept."
+    }
+  ]
+}
