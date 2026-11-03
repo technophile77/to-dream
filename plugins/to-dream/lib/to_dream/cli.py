@@ -6,7 +6,8 @@ sub-commands through ``add_parser(subparsers)`` (registered lazily, so a missing
 
 Example::
 
-    to-dream run --project . --dry-run
+    to-dream run --project=. --dry-run
+    to-dream run --project=-home-sam-proj      # POSIX slugs start with '-'; use the = form (a plain space also works)
     to-dream show proj-261102-1830 --diff
     to-dream apply proj-261102-1830 --only 1 3
     to-dream reject proj-261102-1830 --only 2 --reason "too verbose"
@@ -23,6 +24,7 @@ from typing import Any
 from to_dream import config, gitops, runner, state as dstate
 
 COMMAND_PREFIX = "to-dream"
+VALUE_OPTIONS = ("--project",)  # options whose value may legitimately start with "-" (POSIX project slugs do)
 EXTRA_COMMAND_MODULES = ("doctor", "schedule", "update", "runtime", "repo_setup")
 
 
@@ -68,6 +70,35 @@ def print_json(data: Any) -> None:
 
 
 # --------------------------------------------------------------------------- parser
+
+
+def fold_option_values(argv: list[str], parser: argparse.ArgumentParser | None = None) -> list[str]:
+    """Glue each ``VALUE_OPTIONS`` flag to the token after it (``--project X`` -> ``--project=X``).
+
+    On macOS/Linux every Claude Code project slug starts with ``-`` (``/home/u/proj`` is
+    ``-home-u-proj``), which argparse would take for another option. The next token is treated as the
+    value unless it is itself one of the sub-command's known option strings.
+
+    >>> fold_option_values(["run", "--project", "-home-u-proj", "--dry-run"])
+    ['run', '--project=-home-u-proj', '--dry-run']
+    >>> fold_option_values(["run", "--project", "--dry-run"])
+    ['run', '--project', '--dry-run']
+    """
+    known = set(parser._option_string_actions) if parser else set()
+    folded: list[str] = []
+    tokens = iter(argv)
+    for token in tokens:
+        if token in VALUE_OPTIONS:
+            following = next(tokens, None)
+            if following is None:
+                folded.append(token)
+            elif following in known or following in ("-h", "--help"):
+                folded += [token, following]
+            else:
+                folded.append(f"{token}={following}")
+        else:
+            folded.append(token)
+    return folded
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -412,7 +443,9 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(main(["list", "--json"]))
     """
     use_utf8(sys.stdout, sys.stderr)
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    run_parser = parser._subparsers._group_actions[0].choices["run"]
+    args = parser.parse_args(fold_option_values(list(sys.argv[1:] if argv is None else argv), run_parser))
     try:
         return args.func(args)
     except EXPECTED_ERRORS as exc:

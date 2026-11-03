@@ -24,7 +24,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Iterable
 
 from to_dream import config, gitops, state as dstate
@@ -373,14 +373,19 @@ def build_prompt_values(
 
 
 def read_rule(path: Path | str, recursive: bool = False) -> str:
-    """Build a Claude ``Read(...)`` permission rule for an absolute path (``//c/dir/**`` on Windows).
+    """Build a Claude ``Read(...)`` permission rule for an absolute path, whatever OS it comes from.
 
-    >>> read_rule(Path("C:/Users/a/proj"), recursive=True)
+    POSIX paths become ``Read(//home/u/p)``; Windows drive paths (either separator) become
+    ``Read(//c/Users/u/p)``. ``recursive`` appends ``/**``.
+
+    >>> read_rule("/home/u/proj", recursive=True)
+    'Read(//home/u/proj/**)'
+    >>> read_rule("C:/Users/a/proj", recursive=True)
     'Read(//c/Users/a/proj/**)'
     """
-    text = Path(path).as_posix()
-    if re.match(r"^[A-Za-z]:", text):
-        text = "/" + text[0].lower() + text[2:]
+    text = path.as_posix() if isinstance(path, PurePath) else str(path)
+    if re.match(r"^[A-Za-z]:([\\/]|$)", text):
+        text = "/" + text[0].lower() + text[2:].replace("\\", "/")
     return f"Read(/{text}{'/**' if recursive else ''})"
 
 

@@ -171,6 +171,70 @@ class CliTests(CliCase):
         self.assertIn("No dream runs", self.call("list")[1])
 
 
+class DashProjectCliTests(CliCase):
+    """POSIX project slugs start with "-"; argparse must take them as --project's value."""
+
+    SLUG = "-home-u-proj"
+
+    def setUp(self):
+        super().setUp()
+        (self.root / self.SLUG / "memory").mkdir(parents=True)
+
+    def project_calls(self):
+        return [os.path.basename(c["project_dir"]) for c in self.distill.calls]
+
+    def test_fold_option_values(self):
+        fold = cli.fold_option_values
+        self.assertEqual(fold(["run", "--project", "-a-b", "--dry-run"]), ["run", "--project=-a-b", "--dry-run"])
+        self.assertEqual(fold(["run", "--project=-a-b"]), ["run", "--project=-a-b"])
+        self.assertEqual(fold(["run", "--project", "all"]), ["run", "--project=all"])
+        self.assertEqual(fold(["run", "--project"]), ["run", "--project"])
+        self.assertEqual(fold(["list"]), ["list"])
+        run_parser = cli.build_parser()._subparsers._group_actions[0].choices["run"]
+        self.assertEqual(fold(["run", "--project", "--dry-run"], run_parser), ["run", "--project", "--dry-run"])
+        self.assertEqual(fold(["run", "--project", "--hidden-x"], run_parser), ["run", "--project=--hidden-x"])
+
+    def test_space_and_equals_forms_both_work(self):
+        self.plan(report="# none\n")
+        for argv in (["run", "--project", self.SLUG], ["run", f"--project={self.SLUG}"],
+                     ["run", "--project", self.SLUG, "--dry-run"], ["run", "--dry-run", "--project", self.SLUG]):
+            with self.subTest(argv=argv):
+                self.distill.calls.clear()
+                code, out, err = self.call(*argv)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.project_calls(), [self.SLUG])
+
+    def test_a_missing_value_is_still_an_error(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(["run", "--project"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.main(["run", "--project", "--dry-run"])  # "--dry-run" is not swallowed as the project
+
+    def test_a_double_dash_slug_is_a_value_too(self):
+        (self.root / "--hidden-proj" / "memory").mkdir(parents=True)
+        self.plan(report="# none\n")
+        self.assertEqual(self.call("run", "--project", "--hidden-proj")[0], 0)
+        self.assertEqual(self.project_calls(), ["--hidden-proj"])
+
+    def test_posix_path_form_resolves_to_the_dash_slug(self):
+        self.assertEqual(runner.resolve_slug("/home/u/proj", self.root), self.SLUG)
+
+    def test_from_a_real_process_without_a_shell(self):
+        result = subprocess.run([sys.executable, "-m", "to_dream", "run", "--project", self.SLUG, "--dry-run"],
+                                cwd=LIB_DIR, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(self.SLUG, result.stdout)
+
+    def test_the_documented_commands_use_the_equals_form(self):
+        plugin = LIB_DIR.parent
+        for rel in ("skills/run/SKILL.md", "skills/setup/SKILL.md"):
+            text = (plugin / rel).read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"--project <", rel)
+            self.assertIn("--project=<", text, rel)
+
+
+
+
 class ExtraModuleRegistrationTests(unittest.TestCase):
     def fake_module(self, command, handler):
         def add_parser(subparsers):

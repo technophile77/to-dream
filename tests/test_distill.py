@@ -553,9 +553,10 @@ class StochasticTests(DistillCase):
                 text = digest.digest_path.read_text(encoding="utf-8")
                 self.assertLessEqual(len(text), max_chars, ctx)
                 self.assertEqual(digest.chars, len(text), ctx)
-                self.assertEqual(
-                    tuple(map(int, COUNTS.search(text).groups())),
-                    (exp.prompts, exp.corrections, exp.errors, exp.denials, exp.memory), ctx)
+                if "[truncated]" not in text:  # a tiny budget can cut into the header (its source path is OS-specific)
+                    self.assertEqual(
+                        tuple(map(int, COUNTS.search(text).groups())),
+                        (exp.prompts, exp.corrections, exp.errors, exp.denials, exp.memory), ctx)
                 self.assertEqual((digest.human_prompts, digest.corrections, digest.tool_errors, digest.denials, digest.memory_writes),
                                  (exp.prompts, exp.corrections, exp.errors, exp.denials, exp.memory), ctx)
                 for secret in SECRETS:

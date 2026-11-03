@@ -68,21 +68,21 @@ def install_hook(root, body: str, name: str = "pre-commit") -> Path:
     return hook
 
 
-def render_path(rng: random.Random, parts: list[str], is_windows: bool) -> str:
+def render_path(rng: random.Random, parts: list[str]) -> str:
     """Render ``parts`` (below the drive) as a random Windows-ish spelling of an absolute path.
 
     Forms: ``C:\\``, ``C:/``, mixed separators, MSYS ``/c/``, ``~``, ``$HOME``, with ``.``/``..`` detours,
-    trailing separators and (on Windows) random case. Built independently of ``paths.normalize``.
+    trailing separators and random case. Built independently of ``paths.normalize``.
     """
     body = list(parts)
     uses_home = body[:2] == ["Users", "sam"]
-    form = rng.choice(["back", "fwd", "mixed"] + (["msys"] if is_windows else []) + (["tilde", "homevar"] if uses_home else []))
+    form = rng.choice(["back", "fwd", "mixed", "msys"] + (["tilde", "homevar"] if uses_home else []))
     if form in ("tilde", "homevar"):
         body = body[2:]
     for _ in range(rng.randint(0, 2)):
         pos = rng.randint(0, len(body))
         body[pos:pos] = rng.choice([["junk", ".."], ["."], ["a", "b", "..", ".."]])
-    if is_windows and rng.random() < 0.3:
+    if rng.random() < 0.3:
         body = [rng.choice([s.upper(), s.lower(), s.swapcase()]) for s in body]
     seps = {"back": "\\", "fwd": "/", "msys": "/", "tilde": "/", "homevar": "/"}
 

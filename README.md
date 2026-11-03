@@ -87,7 +87,7 @@ The `to-dream` command (on the Bash tool's PATH while the plugin is enabled):
 |---|---|
 | `doctor [--json]` | Check Python, git, `claude`, the memory repo, updates and the schedule |
 | `init-repo [--branch NAME]` | Make the memory root a git repo that tracks only `*/memory/` (verifies an existing repo, never rewrites it) |
-| `run --project <slug\|path\|all> [--days N \| --since DATE] [--dry-run] [--model M] [--analyst-model M] [--budget-usd N] [--max-sessions N] [--timeout-min N]` | Run a dream |
+| `run --project=<slug\|path\|all> [--days N \| --since DATE] [--dry-run] [--model M] [--analyst-model M] [--budget-usd N] [--max-sessions N] [--timeout-min N]` | Run a dream. Write `--project=<value>` with `=`: on macOS and Linux slugs start with `-` (`-home-sam-proj`) |
 | `list [--json]` | List runs |
 | `show <run-id> [--json \| --diff]` | Show a run's proposed changes |
 | `apply <run-id> [--only N ...] [--force]` | Cherry-pick accepted changes onto the live branch |

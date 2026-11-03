@@ -48,7 +48,7 @@ to-dream/                                  # repo = marketplace
 |---|---|
 | `doctor [--json]` | Check Python ≥ 3.10, git, `claude` on PATH and its version, the memory root, the memory repo's status and branch, and the schedule. Each check is ok, warn or fail with a fix hint. |
 | `init-repo [--branch NAME]` | Make the memory root a git repo that tracks only `/*/memory/` (the `.gitignore` and the `.gitattributes` with `* -text` included). If a repo already exists, verify it and report, but never rewrite it. The default branch name is `memory`. |
-| `run --project <slug\|path\|all> [--days N \| --since YYYY-MM-DD] [--dry-run] [--model M] [--analyst-model M] [--budget-usd N] [--max-sessions N] [--timeout-min N]` | Run a dream. No budget cap by default. `--timeout-min` defaults to 60. |
+| `run --project=<slug\|path\|all> [--days N \| --since YYYY-MM-DD] [--dry-run] [--model M] [--analyst-model M] [--budget-usd N] [--max-sessions N] [--timeout-min N]` | Run a dream. Use `--project=<value>` (with `=`): on macOS/Linux slugs start with `-`. No budget cap by default. `--timeout-min` defaults to 60. |
 | `list [--json]` | List runs with their status. |
 | `show <run-id> [--json \| --diff]` | Show a run's changes, with each change's Change line, diff and report extras. |
 | `apply <run-id> [--only N ...] [--force]` | Snapshot, then cherry-pick onto the live branch. On conflict, abort and report. |
