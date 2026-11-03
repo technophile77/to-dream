@@ -238,13 +238,35 @@ def check_update(force: bool = False, fetch: Fetcher = http_fetch,
     return info
 
 
+CHANGELOG_SUFFIX = "/blob/HEAD/CHANGELOG.md"
+
+
+def updating_url(info: dict) -> str:
+    """Return the README ``#updating`` URL derived from ``info["changelog_url"]`` ('' if unavailable)."""
+    url = info.get("changelog_url") or ""
+    if not url.endswith(CHANGELOG_SUFFIX):
+        return ""
+    return url[:-len(CHANGELOG_SUFFIX)] + "#updating"
+
+
 def reminder_line(info: dict) -> str:
-    """One-line update reminder for ``info`` from :func:`check_update` ('' when up to date)."""
+    """One-line update reminder for ``info`` from :func:`check_update` ('' when up to date).
+
+    The line gives the manual update commands and points to the README's Updating section for
+    auto-update (the ``/plugin`` toggle is terminal-only, so the line does not name it). The
+    README URL is derived from ``info["changelog_url"]`` (built from the plugin.json
+    ``repository`` field); without it the line says "see the README's Updating section".
+
+    Example:
+        >>> reminder_line({"update_available": True, "latest": "0.3.0", "current": "0.2.1",
+        ...                "changelog_url": "https://github.com/o/r/blob/HEAD/CHANGELOG.md"})
+        'to-dream 0.3.0 is out (you have 0.2.1). Update: `/plugin marketplace update to-dream`, then `/reload-plugins`. To update automatically, see https://github.com/o/r#updating.'
+    """
     if not info.get("update_available"):
         return ""
+    target = updating_url(info) or "the README's Updating section"
     return ("to-dream %s is out (you have %s). Update: `/plugin marketplace update to-dream`, then "
-            "`/reload-plugins`. To stop needing this, turn on auto-update under `/plugin` -> "
-            "Marketplaces -> to-dream." % (info["latest"], info["current"]))
+            "`/reload-plugins`. To update automatically, see %s." % (info["latest"], info["current"], target))
 
 
 def _handle(args) -> int:
