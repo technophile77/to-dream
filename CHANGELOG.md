@@ -2,6 +2,14 @@
 
 All notable changes to to-dream are recorded here. Versions follow [semver](https://semver.org/); the source of truth is `version` in `plugins/to-dream/.claude-plugin/plugin.json`.
 
+## 0.1.3 - 2026-11-03
+
+Fix: an older Claude Code session could overwrite the runtime with older code.
+
+- `to-dream sync-runtime` no longer downgrades `$TO_DREAM_HOME/runtime`. When two sessions run different plugin versions, the one on the older version leaves the newer runtime alone and prints a one-line note to stderr (stdout is still only the path, exit code 0). Same-version content differences, older runtimes and unparseable versions still refresh.
+- `to-dream sync-runtime --force` allows a deliberate downgrade, for example a rollback.
+- `to-dream doctor` reports a runtime newer than the plugin as a warning with the update hint, rather than "out of date".
+
 ## 0.1.2 - 2026-11-03
 
 Fix: auto-update instructions only worked in the terminal.

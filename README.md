@@ -97,7 +97,7 @@ The `to-dream` command (on the Bash tool's PATH while the plugin is enabled):
 | `discard <run-id> [--force]` | Remove a run's worktree and branch |
 | `schedule install [--time HH:MM] \| remove \| status [--json]` | Nightly run of `run --project all` |
 | `check-update [--json] [--force]` | Is a newer release out? |
-| `sync-runtime` | Refresh the copy of the code used by scheduled jobs |
+| `sync-runtime [--force]` | Refresh the copy of the code used by scheduled jobs; never downgrades it unless `--force` |
 | `config show \| get KEY \| set KEY VALUE` | Read or change `config.json` |
 
 State lives in `$TO_DREAM_HOME` (see [Uninstall](#uninstall)). Config keys: `model`, `analyst_model`, `default_days`, `timeout_min`, `branch_template`, `worktree_dir`, `worktree_template`, `steering_path`, `schedule_time`, `update_check`.
