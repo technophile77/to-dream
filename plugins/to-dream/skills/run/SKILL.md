@@ -25,8 +25,9 @@ If a command says the memory repo is missing, point the user to `/to-dream:setup
 
 ## 2. Run
 
-- Dry run: `to-dream run --project <project> --dry-run`.
-- Real run: `to-dream run --project <project>`. Mention optional flags only if relevant: `--model`, `--analyst-model`, `--budget-usd N` (a cost cap, useful on API billing), `--max-sessions N`, `--timeout-min N` (default 60).
+- Always write the project as `--project=<project>` (with `=`): on macOS and Linux a project slug starts with `-` (for example `-home-sam-proj`), which a space-separated value would not survive in every shell wrapper.
+- Dry run: `to-dream run --project=<project> --dry-run`.
+- Real run: `to-dream run --project=<project>`. Mention optional flags only if relevant: `--model`, `--analyst-model`, `--budget-usd N` (a cost cap, useful on API billing), `--max-sessions N`, `--timeout-min N` (default 60).
 
 A real dream can take many minutes and uses Claude plan usage. Run it in the background if the Bash tool supports that (`run_in_background`), tell the user it has started, and check back when it finishes rather than polling.
 

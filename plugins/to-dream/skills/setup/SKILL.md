@@ -43,7 +43,7 @@ Explain that a bundled steering file tells the dreaming model what to look for a
 
 ### c. First dry run
 
-Ask which project to try (offer the current project, and list others from `~/.claude/projects` if the user wants). Then run `to-dream run --project <slug-or-path> --dry-run`. A dry run shows what a dream would look at without proposing any changes; show the user the summary it prints and say what it found (sessions, window).
+Ask which project to try (offer the current project, and list others from `~/.claude/projects` if the user wants). Then run `to-dream run --project=<slug-or-path> --dry-run`. A dry run shows what a dream would look at without proposing any changes; show the user the summary it prints and say what it found (sessions, window).
 
 ### d. Nightly schedule (optional)
 

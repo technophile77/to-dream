@@ -203,7 +203,7 @@ class CommitTests(RepoTestCase):
         for (sha, _), path in zip(commits, ["a.md", "b.md", "new topic.md"]):
             self.assertEqual(gitops.changed_paths(self.root, sha), [PREFIX + path])
         self.assertEqual(git(self.root, "show", f"{self.branch}:{PREFIX}a.md"), "alpha v2\n")
-        self.assertEqual(git(self.root, "ls-tree", "-r", "--name-only", self.branch, PREFIX).split("\n")[:-1],
+        self.assertEqual(git(self.root, "ls-tree", "-r", "--name-only", self.branch, "--", PREFIX).split("\n")[:-1],
                          [PREFIX + "a.md", PREFIX + "new topic.md"])
         body = git(self.root, "log", "-1", "--format=%B", commits[0][0])
         self.assertIn("why", body)
@@ -547,7 +547,7 @@ class StochasticCommitTests(RepoTestCase):
             self.assertEqual(len(paths), 1, paths)
             seen.add(paths[0])
         self.assertEqual(seen, {c.path for c in real})
-        tree = git(self.root, "ls-tree", "-r", "-z", "--name-only", branch, PREFIX).split("\0")
+        tree = git(self.root, "ls-tree", "-r", "-z", "--name-only", branch, "--", PREFIX).split("\0")
         in_branch = {p[len(PREFIX):]: git(self.root, "show", f"{branch}:{p}") for p in tree if p}
         self.assertEqual(in_branch, expected)
         on_disk = {p.relative_to(mem).as_posix(): p.read_text(encoding="utf-8") for p in mem.rglob("*") if p.is_file()}

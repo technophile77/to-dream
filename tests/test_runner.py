@@ -4,7 +4,7 @@ import re
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 from helpers import git, install_hook
@@ -115,9 +115,12 @@ class PureHelperTests(unittest.TestCase):
     def test_read_rule(self):
         self.assertEqual(runner.read_rule(Path("C:/Users/a/proj"), recursive=True), "Read(//c/Users/a/proj/**)")
         self.assertEqual(runner.read_rule("E:\\x\\CLAUDE.md"), "Read(//e/x/CLAUDE.md)")
-        if os.name != "nt":
-            self.assertEqual(runner.read_rule("/home/a"), "Read(//home/a)")
-            self.assertEqual(runner.read_rule("/home/a/p", recursive=True), "Read(//home/a/p/**)")
+        self.assertEqual(runner.read_rule("c:/x"), "Read(//c/x)")
+        # POSIX paths work the same on every OS (the rule builder is pure string logic)
+        self.assertEqual(runner.read_rule("/home/a"), "Read(//home/a)")
+        self.assertEqual(runner.read_rule("/home/a/p", recursive=True), "Read(//home/a/p/**)")
+        self.assertEqual(runner.read_rule(PurePosixPath("/home/u/proj"), recursive=True), "Read(//home/u/proj/**)")
+        self.assertEqual(runner.read_rule("/home/u/-dash-dir/x.md"), "Read(//home/u/-dash-dir/x.md)")
 
     def test_build_claude_command(self):
         cmd = runner.build_claude_command("claude", "opus", 5.0, Path("/run"), ["Read(//e/p/**)"])
@@ -255,7 +258,7 @@ class EndToEndTests(DreamTestCase):
         self.assertEqual(git(self.root, "show", f"{summary.branch}:{prefix}topic.md"), "prefers tabs\n")
         self.assertFalse((summary.worktree / self.slug / "memory" / "ghost.md").exists())
         self.assertEqual(
-            git(self.root, "ls-tree", "-r", "--name-only", summary.branch, prefix).split(),
+            git(self.root, "ls-tree", "-r", "--name-only", summary.branch, "--", prefix).split(),
             [prefix + "MEMORY.md", prefix + "a.md", prefix + "topic.md"],
         )
 
@@ -441,6 +444,62 @@ class EndToEndTests(DreamTestCase):
         git(self.root, "checkout", "-q", "--detach")
         with self.assertRaisesRegex(runner.PreflightError, "detached"):
             runner.run_all(runner.RunOptions(), now=NOW, echo=False)
+
+
+class DashSlugTests(DreamTestCase):
+    """POSIX slugs start with "-" (/home/u/proj -> -home-u-proj); git must never read them as switches."""
+
+    DASH_SLUG = "-home-u-proj"
+
+    def setUp(self):
+        super().setUp()
+        self.slug = self.DASH_SLUG
+        self.slug_short = "home-u-proj"
+        self.memory = self.root / self.slug / "memory"
+        self.memory.mkdir(parents=True)
+        for name, text in SEED_FILES.items():
+            (self.memory / name).write_text(text, encoding="utf-8", newline="\n")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "seed dash project")
+        self.seed_head = git(self.root, "rev-parse", "HEAD").strip()
+
+    def test_whole_lifecycle_with_a_dash_leading_slug(self):
+        (self.memory / "a.md").write_text("alpha edited\n", newline="\n")  # exercised by the snapshot
+        self.plan(**HAPPY)
+        summary = runner.run_project(self.slug, runner.RunOptions(), now=NOW, echo=False)
+        self.assertEqual(summary.status, runner.STATUS_PENDING)
+        self.assertEqual([c.file for c in summary.commits], ["MEMORY.md", "b.md", "topic.md"])
+        prefix = f"{self.slug}/memory/"
+        self.assertEqual(git(self.root, "show", f"{summary.branch}:{prefix}topic.md"), "prefers tabs\n")
+        self.assertEqual(git(self.root, "show", f"{summary.branch}:{prefix}a.md"), "alpha edited\n")
+        self.assertTrue((summary.worktree / self.slug / "memory" / "topic.md").is_file())
+        self.assertEqual(gitops.changed_paths(self.root, summary.commits[2].sha), [prefix + "topic.md"])
+        report = runner.apply_run(summary.run_id, [3])
+        self.assertIsNone(report.result.failed)
+        self.assertEqual((self.memory / "topic.md").read_text(), "prefers tabs\n")
+        (self.memory / "a.md").write_text("edited again\n", newline="\n")
+        report = runner.apply_run(summary.run_id)  # snapshot first, then the rest
+        self.assertIsNone(report.result.failed)
+        self.assertEqual(report.snapshot.committed, (prefix + "a.md",))
+        self.assertFalse((self.memory / "b.md").exists())
+        runner.discard_run(summary.run_id)
+        self.assertFalse(summary.worktree.exists())
+        self.assertEqual(self.branches(), [BASE_BRANCH])
+
+    def test_out_of_scope_revert_with_a_dash_slug(self):
+        self.plan(**dict(HAPPY, write={**HAPPY["write"], "../../other/memory/x.md": "sneaky\n"}))
+        summary = runner.run_project(self.slug, runner.RunOptions(), now=NOW, echo=False)
+        self.assertEqual(len(summary.commits), 3)
+        self.assertTrue(any("other/memory/x.md" in w for w in summary.warnings))
+        self.assertFalse((summary.worktree / "other").exists())
+
+    def test_secret_scan_with_a_dash_slug(self):
+        self.plan(**dict(HAPPY, write={**HAPPY["write"], "topic.md": f"token {SECRET}\n"}))
+        summary = runner.run_project(self.slug, runner.RunOptions(), now=NOW, echo=False)
+        self.assertEqual([n for n, _ in summary.rejected], ["topic.md"])
+        self.assertIn(f"{self.slug}/memory/topic.md:1 github-token", summary.rejected[0][1])
+
+
 
 
 class BaseBranchTests(DreamTestCase):
