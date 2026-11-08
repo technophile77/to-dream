@@ -195,6 +195,33 @@ class PermissionsFileTests(DreamTestCase):
         self.assertEqual([a for a in allowed if "settings" in a], [])
         self.assertIn((summary.run_dir / "permissions.md").as_posix(), call["stdin"])
 
+    def test_settings_files_are_denied_to_the_dream_so_the_recursive_project_read_cannot_reach_them(self):
+        self.dream()
+        argv = self.claude_call()["argv"]
+        denied = argv[argv.index("--disallowedTools") + 1: argv.index("--add-dir")]
+
+        def expected(path: Path) -> str:  # written out by hand: drive letters become //<lowercase drive>/...
+            text = path.as_posix()
+            return f"Read(//{text[0].lower()}{text[2:]})" if text[1:2] == ":" else f"Read(/{text})"
+
+        for settings in (self.shared, self.local, self.user_file):
+            with self.subTest(settings=settings.name):
+                self.assertIn(expected(settings), denied)
+        self.assertEqual(denied[:4], ["Bash", "PowerShell", "WebFetch", "WebSearch"])
+
+    def test_git_root_settings_are_denied_too(self):
+        repo = self.tmp / "repo-deny"
+        sub = repo / "app"
+        (repo / ".git").mkdir(parents=True)
+        (sub / ".claude").mkdir(parents=True)  # own .claude dir: the git root is not an edit target, but is still denied
+        rules = runner.settings_deny_rules(sub)
+        for path in (repo / ".claude" / "settings.json", repo / ".claude" / "settings.local.json",
+                     sub / ".claude" / "settings.json", sub / ".claude" / "settings.local.json",
+                     dstate.claude_home() / "settings.json"):
+            with self.subTest(path=path):
+                self.assertIn(runner.read_rule(path), rules)
+        self.assertEqual(runner.settings_deny_rules(None), [runner.read_rule(dstate.claude_home() / "settings.json")])
+
     def test_nearest_git_root_is_used_when_the_project_dir_has_no_claude_dir(self):
         for dot_git in ("dir", "file"):
             with self.subTest(dot_git=dot_git):

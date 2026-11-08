@@ -41,7 +41,8 @@ In Claude Code:
           |
           v
   2. distill   plain Python, no model: prompts, corrections, tool errors,
-          |    denials, repeated failures, memory writes (secrets masked)
+          |    denials, permission friction, repeated failures, memory writes
+          |    (secrets masked)
           v
   3. dream     claude -p headless: orchestrator splits digests across analyst
           |    subagents, checks evidence + staleness, edits memory in a git
@@ -55,13 +56,33 @@ In Claude Code:
                rejections are logged so future dreams don't repeat them
 ```
 
+### Roll-up: one pending run per project
+
+If you haven't reviewed a project's last dream by the time the next one runs, the new dream doesn't pile up beside it. It starts its window at the oldest unreviewed run's start, so patterns that span several days count in full, and when it succeeds it **supersedes** those runs (status `superseded`, with `superseded_by` naming the new one; their worktrees and branches are removed). Changes you already accepted are live and rejected ones are in the rejection log, so neither comes back; anything still warranted is proposed again, and leftovers are not logged as rejected. A failed dream leaves the earlier runs alone. Turn it off with `to-dream config set rollup false`.
+
+### Permission suggestions
+
+Besides memory, a dream looks for calls that keep interrupting you. The digests tag four kinds of event:
+
+- **blocked**: Claude Code's auto-mode classifier refused the call (with its stated reason),
+- **approved after block**: the same call succeeded later, so you presumably approved it by hand,
+- **interrupted**: you stopped a call that ran without a prompt, and
+- **rejected at prompt**: you said no at a permission prompt.
+
+`INDEX.md` counts these per tool call across all sessions. From those counts the dream may add a `## Permission suggestions` section to its report: an `allow` rule for a call you approved after a block at least twice, or an `ask` rule for a call you interrupted at least twice (or once, then corrected). Rejections at a prompt are context only. Rules are as narrow as the observed calls (an exact command, or a prefix through the subcommand), and the dream skips rules that are already covered, overridden by a `deny`, or that you declined before.
+
+Rules are never applied by the dream. `/to-dream:review` asks about each one and adds it to the settings file you choose: `.claude/settings.local.json` (personal, the default), `.claude/settings.json` (shared with the project) or `~/.claude/settings.json` (everywhere). A rejected rule is logged so it isn't suggested again without new evidence.
+
+- **The dream only sees the `permissions` object** of your settings files (written, with secrets masked, to a `permissions.md` in the run), never `env` or the rest. The settings files themselves are denied to it.
+- **Auto-mode caveat:** in auto mode, Claude Code ignores broad allow rules (a blanket `Bash(*)`, wildcarded interpreters such as `Bash(python*)`, package-manager run commands such as `npm run …`, and `Agent` or `Monitor`). Such a rule won't stop a classifier block, so the dream suggests the exact command instead. `ask` rules always prompt, and a `deny` or `ask` in any settings file beats an `allow` in any other.
+
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design.
 
 ## Privacy and safety
 
 - **It reads your session transcripts.** For each project you choose, to-dream reads all of its transcripts in `~/.claude/projects` within the time window, including subagent transcripts.
 - **Secrets are masked before any model sees them.** The digests are built in plain Python with secret patterns redacted, and every commit it makes is scanned again. Findings report `path:line rule`, never the value. Masking is pattern-based, so it is a safety net, not a guarantee. Review what you accept.
-- **The headless Claude has no shell and no web access.** It can read the project's source, but can only edit inside the proposal worktree.
+- **The headless Claude has no shell and no web access.** It can read the project's source (but not the project's or your user `settings.json` files, which can hold secrets), and can only edit inside the proposal worktree.
 - **Live memory changes only when you accept.** Proposals live on a separate branch and worktree until you review them.
 - **Nothing is pushed.** to-dream never runs `git push`. If your memory repo has a remote, that is your business.
 - **The transcript format is internal to Claude Code and may change.** If to-dream finds transcript files in a window but can't parse any of them, it warns you.
@@ -89,18 +110,18 @@ The `to-dream` command (on the Bash tool's PATH while the plugin is enabled):
 | `init-repo [--branch NAME]` | Make the memory root a git repo that tracks only `*/memory/` (verifies an existing repo, never rewrites it) |
 | `run --project=<slug\|path\|all> [--days N \| --since DATE] [--dry-run] [--model M] [--analyst-model M] [--budget-usd N] [--max-sessions N] [--timeout-min N]` | Run a dream. Write `--project=<value>` with `=`: on macOS and Linux slugs start with `-` (`-home-sam-proj`) |
 | `list [--json]` | List runs |
-| `show <run-id> [--json \| --diff]` | Show a run's proposed changes |
+| `show <run-id> [--json \| --diff]` | Show a run's proposed changes (`--json` adds the report extras, parsed permission suggestions and settings-file targets) |
 | `apply <run-id> [--only N ...] [--force]` | Cherry-pick accepted changes onto the live branch |
 | `reject <run-id> --only N ... [--reason TEXT]` | Reject changes and remember why |
 | `mark-applied <run-id> --only N ... [--note TEXT]` | Record a change you applied by hand |
-| `reject-suggestion <run-id> --text TEXT [--reason TEXT]` | Log a rejected CLAUDE.md suggestion |
+| `reject-suggestion <run-id> --text TEXT [--kind global\|permission] [--reason TEXT]` | Log a rejected CLAUDE.md suggestion (`global`, the default) or permission rule (`permission`) |
 | `discard <run-id> [--force]` | Remove a run's worktree and branch |
 | `schedule install [--time HH:MM] \| remove \| status [--json]` | Nightly run of `run --project all` |
 | `check-update [--json] [--force]` | Is a newer release out? |
 | `sync-runtime [--force]` | Refresh the copy of the code used by scheduled jobs; never downgrades it unless `--force` |
 | `config show \| get KEY \| set KEY VALUE` | Read or change `config.json` |
 
-State lives in `$TO_DREAM_HOME` (see [Uninstall](#uninstall)). Config keys: `model`, `analyst_model`, `default_days`, `timeout_min`, `branch_template`, `worktree_dir`, `worktree_template`, `steering_path`, `schedule_time`, `update_check`.
+State lives in `$TO_DREAM_HOME` (see [Uninstall](#uninstall)). Config keys: `model`, `analyst_model`, `default_days`, `timeout_min`, `branch_template`, `worktree_dir`, `worktree_template`, `steering_path`, `schedule_time`, `update_check`, `rollup`.
 
 ## Updating
 

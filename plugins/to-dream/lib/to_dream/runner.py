@@ -477,22 +477,45 @@ def budget_args(budget_usd: float | None) -> list[str]:
     return [] if budget_usd is None else ["--max-budget-usd", f"{budget_usd:g}"]
 
 
+def settings_deny_rules(project_dir: str | Path | None) -> list[str]:
+    """Build ``Read(...)`` deny rules for every settings file that could hold secrets.
+
+    Covers the user ``settings.json`` plus ``settings.json`` and ``settings.local.json`` under ``.claude`` of
+    the project directory and of its git root (``env`` blocks may hold credentials; the dream gets the
+    redacted ``permissions.md`` instead). Deny beats the recursive ``Read(<project_dir>/**)`` allow.
+
+    >>> settings_deny_rules("/nonexistent/proj")[-2:]
+    ['Read(//nonexistent/proj/.claude/settings.json)', 'Read(//nonexistent/proj/.claude/settings.local.json)']
+    """
+    roots: list[Path] = []
+    if project_dir:
+        start = Path(project_dir)
+        git_root = permissions.find_git_root(start)
+        roots = [start] + ([git_root] if git_root is not None and git_root != start else [])
+    paths = [dstate.claude_home() / permissions.SETTINGS_FILE]
+    for root in roots:
+        paths += [root / ".claude" / permissions.SETTINGS_FILE, root / ".claude" / permissions.LOCAL_SETTINGS_FILE]
+    return [read_rule(path) for path in paths]
+
+
 def build_claude_command(
-    exe: str, model: str, budget_usd: float | None, run_dir: Path, read_rules: Iterable[str]
+    exe: str, model: str, budget_usd: float | None, run_dir: Path, read_rules: Iterable[str],
+    deny_rules: Iterable[str] = (),
 ) -> list[str]:
     """Build the headless Claude argv (prompt goes on stdin).
 
     Edit/Write are deliberately *not* in ``--allowedTools``: a blanket allow lets Claude write anywhere
     (verified), whereas ``acceptEdits`` alone confines edits to the working dir (the worktree's memory
     dir) and ``--add-dir`` (the run dir). Read access outside those is granted per path via ``Read(...)``
-    rules, which grant no write access.
+    rules, which grant no write access. ``deny_rules`` (e.g. :func:`settings_deny_rules`) are appended to
+    ``--disallowedTools`` after the denied tools and win over any allow rule.
     """
     return [
         exe, "-p", "--output-format", "json", "--no-session-persistence",
         "--permission-mode", "acceptEdits", "--permission-prompts", "none",
         "--model", model, *budget_args(budget_usd),
         "--allowedTools", *ALLOWED_TOOLS, *read_rules,
-        "--disallowedTools", *DENIED_TOOLS,
+        "--disallowedTools", *DENIED_TOOLS, *deny_rules,
         "--add-dir", str(run_dir),
     ]
 
@@ -711,7 +734,8 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
     Roll-up: with config ``rollup`` on (default) and unreviewed runs of the project present, the window starts
     at the earliest of their ``window_since`` and the normal start; once the new run succeeds (pending,
     no-changes or needs-attention) those runs are superseded (``RunSummary.superseded``). A failed run
-    leaves them untouched. ``permissions.md`` (the current permission rules) is written into the run dir.
+    leaves them untouched. ``permissions.md`` (the current permission rules) is written into the run dir, and
+    Claude is denied reading the settings files themselves (:func:`settings_deny_rules`).
 
     Raises:
         PreflightError: environment unusable (see :func:`preflight`).
@@ -787,7 +811,8 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
              read_rule(rejected_log_path()), read_rule(permissions_file),
              read_rule(root / slug / MEMORY_DIRNAME, recursive=True)]
     rules += [read_rule(project_dir, recursive=True)] if project_dir else []
-    command = build_claude_command(claude_executable(), options.model, options.budget_usd, run_dir, rules)
+    command = build_claude_command(claude_executable(), options.model, options.budget_usd, run_dir, rules,
+                                   settings_deny_rules(project_dir))
     budget = "no budget cap" if options.budget_usd is None else f"budget cap ${options.budget_usd:g}"
     log.info(f"running claude ({options.model}, {budget}, timeout {options.timeout_min:g} min)")
     code, out, err, timed_out = run_claude(command, prompt, memory_dir, options.timeout_min * 60)

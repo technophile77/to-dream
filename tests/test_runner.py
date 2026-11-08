@@ -140,6 +140,13 @@ class PureHelperTests(unittest.TestCase):
         self.assertIn("--no-session-persistence", cmd)
         self.assertEqual(cmd[-2:], ["--add-dir", str(Path("/run"))])
 
+    def test_build_claude_command_appends_deny_rules_to_disallowed_tools(self):
+        deny = ["Read(//e/p/.claude/settings.json)", "Read(//e/p/.claude/settings.local.json)"]
+        cmd = runner.build_claude_command("claude", "opus", None, Path("/run"), ["Read(//e/p/**)"], deny)
+        j = cmd.index("--disallowedTools")
+        self.assertEqual(cmd[j + 1: cmd.index("--add-dir")], ["Bash", "PowerShell", "WebFetch", "WebSearch", *deny])
+        self.assertNotIn(deny[0], cmd[cmd.index("--allowedTools"): j])
+
     def test_no_budget_flag_unless_given(self):
         bare = runner.build_claude_command("claude", "opus", None, Path("/run"), [])
         self.assertNotIn("--max-budget-usd", bare)
@@ -201,11 +208,13 @@ class PureHelperTests(unittest.TestCase):
     def test_report_extras_match_the_headings_of_the_bundled_prompt(self):
         template = runner.ORCHESTRATOR_PROMPT.read_text(encoding="utf-8")
         headings = [h for h in re.findall(r"^## (.+?)\s*$", template, re.MULTILINE)
-                    if re.search(r"global|stale|not acted on", h, re.IGNORECASE)]
-        self.assertEqual(len(headings), 3, headings)  # the prompt must still define all three
+                    if re.search(r"global|stale|not acted on|permission", h, re.IGNORECASE)]
+        self.assertEqual(len(headings), 4, headings)  # the prompt must define all four
         report = "".join(f"## {h}\nbody of {i}\n\n" for i, h in enumerate(headings))
         extras = runner.pick_extras(gitops.level2_sections(report))
         by_heading = {h: f"body of {i}" for i, h in enumerate(headings)}
+        self.assertEqual(extras["permission_suggestions"],
+                         next(b for h, b in by_heading.items() if h.lower().startswith("permission")))
         self.assertEqual(extras["global_suggestions"], next(b for h, b in by_heading.items() if "global" in h.lower()))
         self.assertEqual(extras["stale_candidates"], next(b for h, b in by_heading.items() if h.lower().startswith("stale")))
         self.assertEqual(extras["not_acted_on"], next(b for h, b in by_heading.items() if "not acted on" in h.lower()))
