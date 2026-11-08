@@ -16,7 +16,7 @@ Example::
 import json
 import re
 from collections import Counter, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, NamedTuple
@@ -67,12 +67,95 @@ _DENY_STRONG = re.compile(
 _DENY_WORDS = re.compile(r"was rejected|\bdenied\b|hook error|\bblocked\b", re.IGNORECASE)
 _ENTRY = re.compile(r"^- \[(?P<hm>\d\d:\d\d|--:--)\] L(?P<line>\d+) (?P<tag>\S+)")
 
-PRIORITY = {"PROMPT": 0, "MEMORY-WRITE": 1, "ERROR": 2, "**DENIED**": 3, "**CORRECTION**": 3}
+_CLASSIFIER_PREFIX = "Permission for this action was denied by the Claude Code auto mode classifier"
+_CLASSIFIER_REASON = re.compile(r"Reason:\s*\[([^\]]+)\]")
+_INTERRUPT_MARKER = re.compile(r"^\[Request interrupted by user( for tool use)?\]$")
+
+TAG_BLOCKED = "**BLOCKED**"
+TAG_APPROVED = "**APPROVED-AFTER-BLOCK**"
+TAG_INTERRUPTED = "**INTERRUPTED**"
+PRIORITY = {
+    "PROMPT": 0, "MEMORY-WRITE": 1, "ERROR": 2, "**DENIED**": 3, "**CORRECTION**": 3,
+    TAG_BLOCKED: 3, TAG_APPROVED: 3, TAG_INTERRUPTED: 3,
+}
+
+# Permission event kinds (``PermissionEvent.kind``).
+EVENT_BLOCKED = "blocked"
+EVENT_APPROVED = "approved_after_block"
+EVENT_INTERRUPTED = "interrupted"
+EVENT_REJECTED = "rejected_at_prompt"
+UNSPECIFIED_REASON = "unspecified"
+COUNT_KEYS = (
+    "human_prompts", "corrections", "tool_errors", "denials", "memory_writes",
+    EVENT_BLOCKED, EVENT_APPROVED, EVENT_INTERRUPTED, EVENT_REJECTED,
+)  # order of the digest header's "counts:" line
+PERMISSION_ROWS = 30  # most rows in one digest's "Permission events" section
+PERMISSION_REFS = 8  # most refs shown per row
+INDEX_PERMISSION_ROWS = 100  # most rows in INDEX.md's permission table
+
+# Result classes returned by :func:`classify_result`.
+RESULT_OK, RESULT_ERROR, RESULT_BLOCKED = "ok", "error", "blocked"
+RESULT_REJECTED, RESULT_INTERRUPTED, RESULT_DENIED = "rejected", "interrupted", "denied"
+
+
+@dataclass(frozen=True)
+class PermissionEvent:
+    """One permission-related moment of a session, for spotting candidate ``allow``/``ask`` rules.
+
+    ``kind`` is one of ``EVENT_BLOCKED`` (auto-mode classifier refused the call; ``reason`` is its
+    bracketed category), ``EVENT_APPROVED`` (a call blocked earlier ran successfully later, so the
+    user presumably approved it by hand; ``permission_mode`` is the mode then in effect),
+    ``EVENT_INTERRUPTED`` (the user stopped a call that ran without a prompt) or
+    ``EVENT_REJECTED`` (the user said no at a permission prompt). ``followed_by_correction`` is only
+    meaningful for interrupts: the next human prompt pushed back (see :func:`is_correction`).
+    ``tool`` and ``summary`` are redacted; ``line`` is the 1-based source line.
+
+    Example::
+
+        PermissionEvent("Bash", "git push", "blocked", "Credential Materialization", 12, "s1", None, False)
+    """
+
+    tool: str
+    summary: str
+    kind: str
+    reason: str | None
+    line: int
+    session_id: str
+    permission_mode: str | None
+    followed_by_correction: bool
+
+
+@dataclass(frozen=True)
+class PermissionSummary:
+    """Permission events of one ``(tool, summary)`` pair, counted (see :func:`aggregate_permission_events`).
+
+    ``reasons`` are the distinct classifier categories, ``modes`` the distinct permission modes seen
+    at approvals, ``sessions`` the number of distinct sessions involved and ``refs`` the source
+    references (``L<n>``, or ``<digest-file> L<n>`` across digests) in order of appearance.
+    """
+
+    tool: str
+    summary: str
+    blocked: int
+    approved_after_block: int
+    interrupted: int
+    interrupted_then_corrected: int
+    rejected_at_prompt: int
+    sessions: int
+    reasons: tuple[str, ...]
+    modes: tuple[str, ...]
+    refs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class SessionDigest:
-    """Summary of one written digest file (counts are totals in the window, before size trimming)."""
+    """Summary of one written digest file (counts are totals in the window, before size trimming).
+
+    ``denials`` counts every denied call: classifier blocks, user interrupts, prompt rejections and
+    other denials, so it is at least ``blocked + interrupted + rejected_at_prompt``.
+    ``approved_after_block`` is not a denial. ``permission_events`` lists every permission event
+    in file order (untrimmed), for aggregation by :func:`aggregate_permission_events`.
+    """
 
     session_id: str
     digest_path: Path
@@ -88,6 +171,11 @@ class SessionDigest:
     denials: int
     memory_writes: int
     chars: int
+    blocked: int = 0
+    approved_after_block: int = 0
+    interrupted: int = 0
+    rejected_at_prompt: int = 0
+    permission_events: tuple[PermissionEvent, ...] = ()
 
 
 @dataclass
@@ -282,11 +370,64 @@ def is_denial(text: str, is_error: bool, denial_kind: Any = None) -> bool:
     return bool((is_error or denial_kind) and _DENY_WORDS.search(head))
 
 
+def classifier_reason(text: str) -> str:
+    """Extract the bracketed category of an auto-mode classifier block (``unspecified`` if absent).
+
+    >>> classifier_reason("Permission for this action was denied ... Reason: [Credential Materialization]. More")
+    'Credential Materialization'
+    """
+    found = _CLASSIFIER_REASON.search(text)
+    return found.group(1).strip() if found else UNSPECIFIED_REASON
+
+
+def classify_result(text: str, is_error: bool, denial_kind: Any = None) -> str:
+    """Classify a tool result as one of the ``RESULT_*`` classes.
+
+    ``blocked``: the auto-mode classifier refused it (``toolDenialKind`` ``automode-blocked``, or
+    the classifier's message). ``rejected``: ``user-rejected``, the user said no at a permission
+    prompt. ``interrupted``: an error saying the user did not want to proceed, with no
+    ``toolDenialKind``, i.e. the call ran without a prompt and the user stopped it. ``denied``:
+    any other denial (a recorded kind such as ``permission-rule``, or hook/deny wording).
+    ``error``: any other failure, including ``toolDenialKind`` ``interrupted``, which only means the
+    session ended before the result was recorded. ``ok``: success.
+
+    >>> classify_result("The user doesn't want to proceed with this tool use.", True)
+    'interrupted'
+    >>> classify_result("The user doesn't want to proceed.", True, "user-rejected")
+    'rejected'
+    >>> classify_result("session ended", True, "interrupted")
+    'error'
+    """
+    if denial_kind == "automode-blocked" or text.startswith(_CLASSIFIER_PREFIX):
+        return RESULT_BLOCKED
+    if denial_kind == "user-rejected":
+        return RESULT_REJECTED
+    if denial_kind == "interrupted":
+        return RESULT_ERROR if is_error else RESULT_OK
+    if isinstance(denial_kind, str) and denial_kind:
+        return RESULT_DENIED
+    if is_error and _DENY_STRONG.search(text[:500]):
+        return RESULT_INTERRUPTED
+    if is_denial(text, is_error, denial_kind):
+        return RESULT_DENIED
+    return RESULT_ERROR if is_error else RESULT_OK
+
+
 class _Collector:
     """Accumulates the events of one transcript window as records are fed in file order."""
 
-    def __init__(self, is_subagent: bool, memory_root: Path, since: datetime | None, until: datetime | None):
+    def __init__(
+        self, is_subagent: bool, memory_root: Path, since: datetime | None, until: datetime | None,
+        session_id: str = "",
+    ):
         self.is_subagent = is_subagent
+        self.ident = session_id
+        self.events: list[PermissionEvent] = []
+        self.pending_blocks: Counter = Counter()  # (tool, summary) blocked and not yet approved
+        self.open_calls: OrderedDict[str, tuple[str, str]] = OrderedDict()  # tool_use without a result yet
+        self.uncorrected: list[int] = []  # indexes into events of interrupts awaiting the next prompt
+        self._mode: str | None = None
+        self._fresh_interrupt = False
         self.memory_root = str(memory_root)
         self.since, self.until = since, until
         self.entries: list[Entry] = []
@@ -324,6 +465,8 @@ class _Collector:
         if kind not in ("user", "assistant") or not isinstance(message, dict):
             return
         self.parsed += 1
+        if kind == "user" and isinstance(record.get("permissionMode"), str):
+            self._mode = record["permissionMode"]
         ts = record.get("timestamp") if isinstance(record.get("timestamp"), str) else self._ts
         self._ts = ts
         blocks = _blocks(message.get("content"))
@@ -359,8 +502,11 @@ class _Collector:
             name, tool_input = block["name"], block.get("input")
             if isinstance(block.get("id"), str):
                 self.tools[block["id"]] = (name, tool_summary(name, tool_input))
+                self.open_calls[block["id"]] = self.tools[block["id"]]
                 if len(self.tools) > TOOL_MAP_LIMIT:
                     self.tools.popitem(last=False)
+                if len(self.open_calls) > TOOL_MAP_LIMIT:
+                    self.open_calls.popitem(last=False)
             if windowed and name in MEMORY_TOOLS and isinstance(tool_input, dict):
                 self._memory_write(lineno, ts, name, tool_input.get("file_path"))
 
@@ -374,14 +520,23 @@ class _Collector:
     def _user(self, lineno: int, ts: str | None, record: dict, blocks: list[dict]) -> None:
         """Handle a user record: tool results become failures, otherwise maybe a human prompt."""
         results = [b for b in blocks if b.get("type") == "tool_result"]
+        interrupt_seen = self._fresh_interrupt  # an interrupt logged from the previous record
+        self._fresh_interrupt = False
         for block in results:
             self._tool_result(lineno, ts, record, block)
+        if _INTERRUPT_MARKER.match(strip_harness(_text_of(b for b in blocks if b.get("type") == "text"))):
+            if not (results or interrupt_seen or self._fresh_interrupt):
+                self._interrupt_open_call(lineno, ts)  # a call that never got a result
+            self._fresh_interrupt = False
+            return
         if results or self.is_subagent:
             return
         prompt = human_prompt(record)
         if prompt is None:
             return
         text, total = prompt
+        self.open_calls.clear()
+        self._mark_corrected(is_correction(text))
         self.counts["human_prompts"] += 1
         shown = safe(text, PROMPT_CHARS)
         if is_correction(text):
@@ -396,14 +551,77 @@ class _Collector:
         """Log an erroring or denied tool result, resolving the tool name from earlier tool_use."""
         text = _result_text(block)
         is_error = block.get("is_error") is True
-        denied = is_denial(text, is_error, record.get("toolDenialKind"))
-        if not (is_error or denied):
+        denial_kind = record.get("toolDenialKind") if isinstance(record.get("toolDenialKind"), str) else None
+        call_id = block.get("tool_use_id") if isinstance(block.get("tool_use_id"), str) else None
+        self.open_calls.pop(call_id, None)
+        name, summary = self.tools.get(call_id, (UNKNOWN_TOOL, ""))
+        outcome = classify_result(text, is_error, denial_kind)
+        if outcome == RESULT_OK:
+            self._maybe_approved(lineno, ts, name, summary)
             return
-        name, summary = self.tools.get(block.get("tool_use_id"), (UNKNOWN_TOOL, ""))
         self.failures[(name, summary)] += 1
-        self.counts["denials" if denied else "tool_errors"] += 1
-        tag = "**DENIED**" if denied else "ERROR"
-        self.entries.append(Entry(lineno, ts, tag, f"{name} `{summary}`: {safe(text, ERROR_CHARS)}"))
+        shown = safe(text, ERROR_CHARS)
+        if outcome == RESULT_ERROR:
+            self.counts["tool_errors"] += 1
+            self.entries.append(Entry(lineno, ts, "ERROR", f"{name} `{summary}`: {shown}"))
+            return
+        self.counts["denials"] += 1
+        if outcome == RESULT_BLOCKED:
+            reason = safe(classifier_reason(text), TITLE_CHARS)
+            self.pending_blocks[(name, summary)] += 1
+            self._log_event(EVENT_BLOCKED, TAG_BLOCKED, lineno, ts, name, summary, reason,
+                            f"{name} `{summary}`: classifier [{reason}]")
+        elif outcome == RESULT_INTERRUPTED:
+            self._log_interrupt(lineno, ts, name, summary, shown)
+        else:
+            suffix = f" ({safe(denial_kind, 40)})" if denial_kind else ""
+            if outcome == RESULT_REJECTED:
+                self._log_event(EVENT_REJECTED, "**DENIED**", lineno, ts, name, summary, None,
+                                f"{name} `{summary}`{suffix}: {shown}")
+            else:
+                self.entries.append(Entry(lineno, ts, "**DENIED**", f"{name} `{summary}`{suffix}: {shown}"))
+
+    def _log_event(
+        self, kind: str, tag: str, lineno: int, ts: str | None, name: str, summary: str,
+        reason: str | None, text: str, mode: str | None = None,
+    ) -> None:
+        """Count a permission event, remember it and add its timeline entry."""
+        self.counts[kind] += 1
+        self.events.append(PermissionEvent(name, summary, kind, reason, lineno, self.ident, mode, False))
+        self.entries.append(Entry(lineno, ts, tag, text))
+
+    def _log_interrupt(self, lineno: int, ts: str | None, name: str, summary: str, detail: str) -> None:
+        """Log a user interrupt of a call that ran without a prompt; the next prompt may correct it."""
+        self.uncorrected.append(len(self.events))
+        self._fresh_interrupt = True
+        self._log_event(EVENT_INTERRUPTED, TAG_INTERRUPTED, lineno, ts, name, summary, None,
+                        f"{name} `{summary}`: {detail}" if detail else f"{name} `{summary}`: interrupted by user")
+
+    def _interrupt_open_call(self, lineno: int, ts: str | None) -> None:
+        """Treat a bare interrupt marker as stopping the latest tool call that has no result."""
+        if self.open_calls:
+            name, summary = self.open_calls.popitem()[1]
+            self.counts["denials"] += 1
+            self.failures[(name, summary)] += 1
+            self._log_interrupt(lineno, ts, name, summary, "interrupted by user before any result")
+            self._fresh_interrupt = False
+
+    def _maybe_approved(self, lineno: int, ts: str | None, name: str, summary: str) -> None:
+        """A success for a key blocked earlier means the user approved it by hand; log it once per block."""
+        key = (name, summary)
+        if self.pending_blocks[key] <= 0:
+            return
+        self.pending_blocks[key] -= 1
+        mode = safe(self._mode, 40) if self._mode else None
+        self._log_event(EVENT_APPROVED, TAG_APPROVED, lineno, ts, name, summary, None,
+                        f"{name} `{summary}`: ran after an earlier block (mode: {mode or 'unknown'})", mode)
+
+    def _mark_corrected(self, corrected: bool) -> None:
+        """Flag pending interrupts as followed by a correction if the next human prompt is one."""
+        if corrected:
+            for index in self.uncorrected:
+                self.events[index] = replace(self.events[index], followed_by_correction=True)
+        self.uncorrected.clear()
 
 
 def _stream(path: Path) -> Iterable[tuple[int, dict]]:
@@ -478,7 +696,7 @@ def _header(
         f"- branches: {safe(', '.join(col.branches), 200) or '(unknown)'}",
         f"- window: {col.first_ts or '?'} .. {col.last_ts or '?'} (UTC; refs L<n> = line in source jsonl)",
         "- counts: " + " ".join(
-            f"{k}={c[k]}" for k in ("human_prompts", "corrections", "tool_errors", "denials", "memory_writes")
+            f"{k}={c[k]}" for k in COUNT_KEYS
         ),
     ]
     if dropped:
@@ -492,10 +710,85 @@ def _repeat_lines(failures: Counter) -> list[str]:
     return [f"- {name} `{summary}` x{n}" for (name, summary), n in repeated]
 
 
-def _compose(header: list[str], timeline: list[str], repeats: list[str]) -> str:
-    """Assemble header, timeline and repeated-failure sections into the digest body."""
+def _summarise(pairs: Iterable[tuple[PermissionEvent, str]]) -> list[PermissionSummary]:
+    """Group ``(event, ref)`` pairs by ``(tool, summary)`` and count them, most useful first.
+
+    Sorted by approvals after a block, then interrupts, then blocks (descending), then by name.
+    """
+    groups: dict[tuple[str, str], list[tuple[PermissionEvent, str]]] = {}
+    for event, ref in pairs:
+        groups.setdefault((event.tool, event.summary), []).append((event, ref))
+    rows = []
+    for (tool, summary), items in groups.items():
+        events = [e for e, _ in items]
+        count = Counter(e.kind for e in events)
+        rows.append(PermissionSummary(
+            tool=tool, summary=summary, blocked=count[EVENT_BLOCKED], approved_after_block=count[EVENT_APPROVED],
+            interrupted=count[EVENT_INTERRUPTED],
+            interrupted_then_corrected=sum(e.followed_by_correction for e in events if e.kind == EVENT_INTERRUPTED),
+            rejected_at_prompt=count[EVENT_REJECTED], sessions=len({e.session_id for e in events}),
+            reasons=tuple(dict.fromkeys(e.reason for e in events if e.kind == EVENT_BLOCKED and e.reason)),
+            modes=tuple(dict.fromkeys(e.permission_mode or "unknown" for e in events if e.kind == EVENT_APPROVED)),
+            refs=tuple(ref for _, ref in items),
+        ))
+    rows.sort(key=lambda r: (-r.approved_after_block, -r.interrupted, -r.blocked, r.tool, r.summary))
+    return rows
+
+
+def aggregate_permission_events(digests: Iterable[SessionDigest]) -> list[PermissionSummary]:
+    """Count permission events across digests per ``(tool, summary)``, most useful rows first.
+
+    Each row says how often a call was blocked by the auto-mode classifier, approved by hand after a
+    block (candidate ``allow`` rule), interrupted by the user while running unprompted (candidate
+    ``ask`` rule; also how many interrupts were followed by a correction) or rejected at a prompt.
+    Refs are ``<digest-file-name> L<n>``.
+
+    Example::
+
+        rows = aggregate_permission_events(distill_project(proj, out))
+        rows[0].tool, rows[0].approved_after_block  # ('mcp__chrome-devtools__get_network_request', 1)
+    """
+    return _summarise(
+        (event, f"{d.digest_path.name} L{event.line}") for d in digests for event in d.permission_events
+    )
+
+
+def _count_part(count: int, label: str) -> str:
+    """Render ``<label> <count>``, used by the permission section."""
+    return f"{label} {count}"
+
+
+def _permission_line(row: PermissionSummary) -> str:
+    """Render one ``(tool, summary)`` row of a digest's permission section."""
+    parts = []
+    if row.blocked:
+        parts.append(_count_part(row.blocked, "blocked") + f" ({', '.join(f'[{r}]' for r in row.reasons)})")
+    if row.approved_after_block:
+        parts.append(_count_part(row.approved_after_block, "approved after block") + f" (mode: {', '.join(row.modes)})")
+    if row.interrupted:
+        parts.append(_count_part(row.interrupted, "interrupted") + f" ({row.interrupted_then_corrected} followed by a correction)")
+    if row.rejected_at_prompt:
+        parts.append(_count_part(row.rejected_at_prompt, "rejected at prompt"))
+    return f"- {row.tool} `{row.summary}`: {'; '.join(parts)} - {_refs(row.refs)}"
+
+
+def _refs(refs: tuple[str, ...]) -> str:
+    """Join refs, showing at most ``PERMISSION_REFS`` and noting how many were left out."""
+    shown = ", ".join(refs[:PERMISSION_REFS])
+    return shown + (f", +{len(refs) - PERMISSION_REFS} more" if len(refs) > PERMISSION_REFS else "")
+
+
+def _permission_lines(events: Iterable[PermissionEvent]) -> list[str]:
+    """Render a digest's "Permission events" rows (at most ``PERMISSION_ROWS``)."""
+    rows = _summarise((e, f"L{e.line}") for e in events)
+    return [_permission_line(row) for row in rows[:PERMISSION_ROWS]]
+
+
+def _compose(header: list[str], timeline: list[str], repeats: list[str], permissions: list[str]) -> str:
+    """Assemble header, timeline, repeated-failure and permission-event sections into the digest body."""
     parts = [*header, "", "## Timeline", *(timeline or ["(no events)"]), "", "## Repeated failures"]
     parts += repeats or ["(none)"]
+    parts += ["", "## Permission events", *(permissions or ["(none)"])]
     return "\n".join(parts) + "\n"
 
 
@@ -565,7 +858,7 @@ def distill_transcript(
         return None
     is_sub = is_subagent_path(path)
     ident, suffix = _identity(path)
-    col = _Collector(is_sub, memory_root, since, until)
+    col = _Collector(is_sub, memory_root, since, until, ident)
     for lineno, record in _stream(path):
         col.feed(lineno, record)
     if stats is not None and status.st_size > 0:
@@ -575,10 +868,11 @@ def distill_transcript(
         return None
     meta = _read_meta(path) if is_sub else {}
     repeats = _repeat_lines(col.failures)
-    fixed = len(_compose(_header(ident, path, is_sub, col, meta, col.title, Counter()), [], repeats))
+    permissions = _permission_lines(col.events)
+    fixed = len(_compose(_header(ident, path, is_sub, col, meta, col.title, Counter()), [], repeats, permissions))
     kept, dropped = trim_entries(col.entries, max_chars - fixed - NOTE_RESERVE)
     header = _header(ident, path, is_sub, col, meta, col.title, dropped)
-    body = _compose(header, [e.render() for e in kept], repeats)
+    body = _compose(header, [e.render() for e in kept], repeats, permissions)
     if len(body) > max_chars:
         body = body[: max(max_chars - 16, 0)] + "\n…[truncated]\n"
         body = body[:max_chars]
@@ -591,7 +885,9 @@ def distill_transcript(
         session_id=ident, digest_path=target, source=path, is_subagent=is_sub, title=col.title,
         cwd=cwd, first_ts=col.first_ts, last_ts=col.last_ts, human_prompts=c["human_prompts"],
         corrections=c["corrections"], tool_errors=c["tool_errors"], denials=c["denials"],
-        memory_writes=c["memory_writes"], chars=len(body),
+        memory_writes=c["memory_writes"], chars=len(body), blocked=c[EVENT_BLOCKED],
+        approved_after_block=c[EVENT_APPROVED], interrupted=c[EVENT_INTERRUPTED],
+        rejected_at_prompt=c[EVENT_REJECTED], permission_events=tuple(col.events),
     )
 
 
@@ -645,8 +941,33 @@ def _cell(text: Any) -> str:
     return str(text if text is not None else "").replace("|", "\\|").replace("\n", " ")
 
 
+PERMISSION_TABLE_HEADER = (
+    "| tool | input | blocked | approved after block | interrupted | interrupted then corrected "
+    "| rejected at prompt | sessions | block reasons | approval modes | refs |"
+)
+
+
+def _permission_table(rows: list[PermissionSummary]) -> list[str]:
+    """Render permission summaries as markdown table lines, or ``(none)`` when there are none."""
+    if not rows:
+        return ["(none)"]
+    lines = [PERMISSION_TABLE_HEADER, "|" + "---|" * 11]
+    for r in rows[:INDEX_PERMISSION_ROWS]:
+        lines.append(
+            f"| {_cell(r.tool)} | {_cell(r.summary)} | {r.blocked} | {r.approved_after_block} | {r.interrupted} "
+            f"| {r.interrupted_then_corrected} | {r.rejected_at_prompt} | {r.sessions} "
+            f"| {_cell(', '.join(r.reasons))} | {_cell(', '.join(r.modes))} | {_cell(_refs(r.refs))} |"
+        )
+    if len(rows) > INDEX_PERMISSION_ROWS:
+        lines.append(f"({len(rows) - INDEX_PERMISSION_ROWS} more rows not shown)")
+    return lines
+
+
 def write_index(digests: list[SessionDigest], out_dir: Path) -> Path:
     """Write ``INDEX.md`` (newest first table of digests with counts and totals) and return its path.
+
+    A final "## Permission events (all sessions)" table aggregates the digests' permission events
+    per tool call (:func:`aggregate_permission_events`); its header row is ``PERMISSION_TABLE_HEADER``.
 
     Example::
 
@@ -654,25 +975,32 @@ def write_index(digests: list[SessionDigest], out_dir: Path) -> Path:
     """
     ordered = sorted(digests, key=_sort_key, reverse=True)
     rows = [
-        "| digest | session | title | window (UTC) | prompts | corrections | errors | denials | memory writes |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| digest | session | title | window (UTC) | prompts | corrections | errors | denials | memory writes "
+        "| blocked | approved after block | interrupted | rejected at prompt |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for d in ordered:
         kind = "subagent " if d.is_subagent else ""
         rows.append(
             f"| [{_cell(d.digest_path.name)}]({_cell(d.digest_path.name)}) | {kind}{_cell(d.session_id[:8])} "
             f"| {_cell(d.title)} | {_cell(d.first_ts)} .. {_cell(d.last_ts)} | {d.human_prompts} "
-            f"| {d.corrections} | {d.tool_errors} | {d.denials} | {d.memory_writes} |"
+            f"| {d.corrections} | {d.tool_errors} | {d.denials} | {d.memory_writes} "
+            f"| {d.blocked} | {d.approved_after_block} | {d.interrupted} | {d.rejected_at_prompt} |"
         )
     totals = {
         "prompts": sum(d.human_prompts for d in ordered), "corrections": sum(d.corrections for d in ordered),
         "errors": sum(d.tool_errors for d in ordered), "denials": sum(d.denials for d in ordered),
         "memory writes": sum(d.memory_writes for d in ordered),
+        "blocked": sum(d.blocked for d in ordered),
+        "approved after block": sum(d.approved_after_block for d in ordered),
+        "interrupted": sum(d.interrupted for d in ordered),
+        "rejected at prompt": sum(d.rejected_at_prompt for d in ordered),
     }
     lines = [
         "# Digest index", "",
         f"{len(ordered)} digests ({sum(d.is_subagent for d in ordered)} subagent).", "", *rows, "",
         "**Totals:** " + ", ".join(f"{k}={v}" for k, v in totals.items()),
+        "", "## Permission events (all sessions)", "", *_permission_table(aggregate_permission_events(ordered)),
     ]
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / "INDEX.md"
