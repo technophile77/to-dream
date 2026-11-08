@@ -4,7 +4,8 @@ Live memory is only ever changed by a snapshot commit (uncommitted memory edits,
 branches or an apply picks) and by ``apply_run``. Claude edits a worktree on a proposal branch; this
 module turns its edits into one commit per file (with evidence from ``DREAM_REPORT.md``). ``apply_run``
 and ``discard_run`` are the only operations that cherry-pick onto the live branch or delete a dream
-branch, and both are user-initiated. Nothing is ever pushed.
+branch on request; the one other deletion is a successful roll-up run superseding the project's older
+unreviewed runs (``supersede_run``). Nothing is ever pushed.
 
 The branch checked out in the memory root when a run starts is its *base branch*; it is recorded in the
 run and ``apply`` refuses to run while a different branch is checked out.
@@ -27,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePath
 from typing import Any, Callable, Iterable
 
-from to_dream import config, gitops, state as dstate
+from to_dream import config, gitops, permissions, state as dstate
 
 MEMORY_DIRNAME = "memory"
 REPORT_NAME = "DREAM_REPORT.md"
@@ -37,8 +38,14 @@ DEFAULT_STEERING = PROMPT_DIR / "steering.md"
 REJECTED_HEADER = (
     "# Rejected dream changes\n\n"
     "Changes the user reviewed and rejected, plus suggestions for the global CLAUDE.md that they turned down "
-    "(headed \"global suggestion\"). Do not propose them again unless new evidence contradicts the reason given.\n"
+    "(headed \"global suggestion\") and permission rules they declined (headed \"permission suggestion\"). "
+    "Do not propose them again unless new evidence contradicts the reason given.\n"
 )
+KIND_GLOBAL = "global"
+KIND_PERMISSION = "permission"
+SUGGESTION_KINDS = (KIND_GLOBAL, KIND_PERMISSION)
+SUGGESTION_HEADINGS = {KIND_GLOBAL: "global suggestion", KIND_PERMISSION: "permission suggestion"}
+NO_ROLLUP_NOTE = "This is not a roll-up."
 REASON_DISCARDED = "discarded with run"
 REASON_NONE = "no reason given"
 ENTRY_CAP = 600
@@ -52,7 +59,7 @@ PLACEHOLDERS = frozenset(
     {
         "slug", "memory_dir", "live_memory_dir", "digest_dir", "digest_index", "report_path",
         "project_dir", "global_claude_md", "steering_path", "analyst_model", "window_since",
-        "window_until", "session_count", "rejected_log",
+        "window_until", "session_count", "rejected_log", "rollup_note", "permissions_path",
     }
 )
 _PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
@@ -73,8 +80,13 @@ STATUS_RUNNING = "running"
 STATUS_DRY_RUN = "dry-run"
 STATUS_NO_SESSIONS = "no-sessions"
 STATUS_FORMAT_DRIFT = "format-drift"
+STATUS_SUPERSEDED = "superseded"  # replaced by a later roll-up run (``superseded_by`` names it)
 FAILING_STATUSES = frozenset({STATUS_FAILED, STATUS_FORMAT_DRIFT})
-INACTIVE_STATUSES = frozenset({STATUS_DISCARDED, STATUS_FAILED, STATUS_EMPTY, STATUS_RUNNING})
+INACTIVE_STATUSES = frozenset(
+    {STATUS_DISCARDED, STATUS_FAILED, STATUS_EMPTY, STATUS_RUNNING, STATUS_SUPERSEDED}
+)
+UNREVIEWED_STATUSES = frozenset({STATUS_PENDING, STATUS_PARTIAL, STATUS_REJECTED})  # as shown by display_status
+ROLLUP_STATUSES = frozenset({STATUS_PENDING, STATUS_EMPTY, STATUS_REJECTED})  # outcomes that supersede older runs
 
 
 class DreamError(RuntimeError):
@@ -152,6 +164,7 @@ class RunSummary:
     warnings: tuple[str, ...] = ()
     message: str = ""
     base_branch: str | None = None
+    superseded: tuple[str, ...] = ()
 
     @property
     def exit_code(self) -> int:
@@ -246,6 +259,61 @@ def resolve_window(
     26
     """
     return (since or last or now - timedelta(days=days)), now
+
+
+def unreviewed_runs(state: dict[str, Any], slug: str) -> list[tuple[str, dict[str, Any]]]:
+    """List a project's unreviewed runs (pending, partially-applied or needs-attention), oldest first.
+
+    "Unreviewed" follows :func:`display_status`: a pending run whose commits are all applied counts as
+    reviewed, a partly applied one does not. Failed, discarded, superseded and empty runs never count.
+
+    >>> unreviewed_runs({"runs": {"a": {"slug": "p", "status": "pending", "commits": [{}]}}}, "p")[0][0]
+    'a'
+    """
+    items = [(run_id, record) for run_id, record in state.get("runs", {}).items()
+             if record.get("slug") == slug and display_status(record) in UNREVIEWED_STATUSES]
+    return sorted(items, key=lambda item: item[1].get("created", ""))
+
+
+def _window_start(record: dict[str, Any]) -> datetime | None:
+    """Return a run record's ``window_since`` as an aware datetime, or None if it is absent or malformed."""
+    try:
+        return dstate.parse_ts(record["window_since"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def rollup_since(since: datetime, unreviewed: list[tuple[str, dict[str, Any]]]) -> datetime:
+    """Return the window start of a roll-up: the earliest of ``since`` and the unreviewed runs' window starts.
+
+    >>> rollup_since(datetime(2026, 11, 5, tzinfo=timezone.utc),
+    ...              [("a", {"window_since": "2026-11-03T00:00:00+00:00"})]).day
+    3
+    """
+    starts = [start for start in (_window_start(record) for _, record in unreviewed) if start]
+    return min([since, *starts])
+
+
+def rollup_note(unreviewed: list[tuple[str, dict[str, Any]]]) -> str:
+    """Describe a roll-up for the orchestrator prompt (``NO_ROLLUP_NOTE`` when there is nothing to replace).
+
+    Example::
+
+        rollup_note([("p-261105-0330", {"window_since": "2026-11-04T09:00:00+00:00",
+                                         "window_until": "2026-11-05T09:00:00+00:00"})])
+        # 'This run replaces earlier unreviewed runs: p-261105-0330 (window 2026-11-04T09:00:00+00:00 .. ...'
+    """
+    if not unreviewed:
+        return NO_ROLLUP_NOTE
+    described = ", ".join(
+        f"{run_id} (window {record.get('window_since', '?')} .. {record.get('window_until', '?')})"
+        for run_id, record in unreviewed
+    )
+    return (
+        f"This run replaces earlier unreviewed runs: {described}. Changes the user already accepted are in "
+        "live memory and rejected ones are in the rejected log, so don't re-propose either; re-propose "
+        "anything still warranted."
+    )
 
 
 def name_fields(short: str, run_id: str, local_now: datetime) -> dict[str, str]:
@@ -349,8 +417,12 @@ def ensure_rejected_log() -> Path:
 def build_prompt_values(
     slug: str, memory_dir: Path, run_dir: Path, index: Path, project_dir: str | None,
     options: RunOptions, since: datetime, until: datetime, session_count: int, steering: Path,
+    permissions_path: Path, note: str = NO_ROLLUP_NOTE,
 ) -> dict[str, str]:
-    """Collect the value of every placeholder of the orchestrator prompt."""
+    """Collect the value of every placeholder of the orchestrator prompt.
+
+    ``permissions_path`` is the run's ``permissions.md``; ``note`` is the :func:`rollup_note` text.
+    """
     return {
         "slug": slug,
         "memory_dir": _posix(memory_dir),
@@ -366,6 +438,8 @@ def build_prompt_values(
         "window_until": dstate.format_ts(until),
         "session_count": str(session_count),
         "rejected_log": _posix(ensure_rejected_log()),
+        "rollup_note": note,
+        "permissions_path": _posix(permissions_path),
     }
 
 
@@ -634,6 +708,11 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
     window exist but none of their records parse, the run stops with ``STATUS_FORMAT_DRIFT`` (exit code 1)
     before calling Claude.
 
+    Roll-up: with config ``rollup`` on (default) and unreviewed runs of the project present, the window starts
+    at the earliest of their ``window_since`` and the normal start; once the new run succeeds (pending,
+    no-changes or needs-attention) those runs are superseded (``RunSummary.superseded``). A failed run
+    leaves them untouched. ``permissions.md`` (the current permission rules) is written into the run dir.
+
     Raises:
         PreflightError: environment unusable (see :func:`preflight`).
         TemplateError: the orchestrator prompt has unknown/unfilled placeholders.
@@ -653,10 +732,13 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
     run_dir = dstate.run_dir(run_id)
     (run_dir / "digests").mkdir(parents=True)
     log = RunLogger(run_dir / "run.log", echo)
-    since, until = resolve_window(
-        dstate.get_last_dream(dstate.load_state(), slug), options.since, options.days, now
-    )
+    state = dstate.load_state()
+    since, until = resolve_window(dstate.get_last_dream(state, slug), options.since, options.days, now)
+    unreviewed = unreviewed_runs(state, slug) if cfg["rollup"] else []
+    since = rollup_since(since, unreviewed)
     log.info(f"dream {run_id}: window {dstate.format_ts(since)} .. {dstate.format_ts(until)}")
+    if unreviewed:
+        log.info(f"roll-up: window extended over unreviewed run(s) {', '.join(r for r, _ in unreviewed)}")
 
     distill = load_distill()
     distill_stats = distill.DistillStats() if hasattr(distill, "DistillStats") else None
@@ -681,6 +763,8 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
         return RunSummary(run_id, slug, STATUS_DRY_RUN, run_dir, index_path=index, stats=stats,
                           session_count=len(digests), warnings=tuple(log.warnings), base_branch=base_branch)
 
+    project_dir = distill.project_cwd(digests)
+    permissions_file, targets = permissions.write_permissions(run_dir, slug, project_dir)
     worktree = worktree_path(cfg, short, run_id, local_now)
     base = _prepare_branch(root, run_id, run_dir, base_branch, branch, worktree, log)
     memory_dir = worktree / slug / MEMORY_DIRNAME
@@ -690,17 +774,18 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
         s, run_id, slug=slug, slug_short=short, branch=branch, base_branch=base_branch, worktree=str(worktree),
         run_dir=str(run_dir), base=base, created=dstate.format_ts(now), window_since=dstate.format_ts(since),
         window_until=dstate.format_ts(until), status=STATUS_RUNNING, commits=[], applied={},
+        permission_targets=targets,
     ))
 
-    project_dir = distill.project_cwd(digests)
     prompt = render_template(
         ORCHESTRATOR_PROMPT.read_text(encoding="utf-8"),
         build_prompt_values(slug, memory_dir, run_dir, index, project_dir, options, since, until, len(digests),
-                            steering),
+                            steering, permissions_file, rollup_note(unreviewed)),
     )
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
     rules = [read_rule(dstate.claude_home() / "CLAUDE.md"), read_rule(steering),
-             read_rule(rejected_log_path()), read_rule(root / slug / MEMORY_DIRNAME, recursive=True)]
+             read_rule(rejected_log_path()), read_rule(permissions_file),
+             read_rule(root / slug / MEMORY_DIRNAME, recursive=True)]
     rules += [read_rule(project_dir, recursive=True)] if project_dir else []
     command = build_claude_command(claude_executable(), options.model, options.budget_usd, run_dir, rules)
     budget = "no budget cap" if options.budget_usd is None else f"budget cap ${options.budget_usd:g}"
@@ -734,9 +819,10 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
         dstate.set_last_dream(s, slug, until)
 
     dstate.update_state(finish)
+    superseded = supersede_runs([r for r, _ in unreviewed], run_id, log) if status in ROLLUP_STATUSES else []
     return RunSummary(run_id, slug, status, run_dir, report_path, index, kept[0], kept[1], tuple(commits),
                       tuple(rejected), outcome.cost, len(digests), stats, tuple(log.warnings),
-                      base_branch=base_branch)
+                      base_branch=base_branch, superseded=tuple(superseded))
 
 
 def run_all(options: RunOptions, now: datetime | None = None, echo: bool = True) -> list[RunSummary | tuple[str, str]]:
@@ -923,39 +1009,47 @@ def reject_run(
 
 
 def reject_suggestion(
-    run_id: str, text: str, reason: str = "", when: datetime | None = None
+    run_id: str, text: str, reason: str = "", when: datetime | None = None, kind: str = KIND_GLOBAL
 ) -> bool:
-    """Log a rejected global CLAUDE.md suggestion in ``rejected.md`` so future dreams stop proposing it.
+    """Log a rejected suggestion in ``rejected.md`` so future dreams stop proposing it.
 
-    The entry sits under a ``## <date> | <slug> | global suggestion`` heading. Repeating the same text
-    for the same run is a no-op. Returns True when an entry was written.
+    ``kind`` is ``"global"`` (a global CLAUDE.md suggestion, the default) or ``"permission"`` (a permission
+    rule, ``text`` being the rule). The entry sits under a ``## <date> | <slug> | <kind> suggestion``
+    heading. Repeating the same text for the same run and kind is a no-op. Returns True when an entry
+    was written.
 
     Example::
 
         reject_suggestion("proj-261102-1830", "Always use tabs", "I prefer spaces")
+        reject_suggestion("proj-261102-1830", "Bash(npm test *)", "too broad", kind="permission")
 
     Raises:
-        RunError: unknown run, or ``text`` is blank.
+        RunError: unknown run, unknown ``kind``, or ``text`` is blank.
     """
+    if kind not in SUGGESTION_KINDS:
+        raise RunError(f"unknown suggestion kind {kind!r}; use one of: {', '.join(SUGGESTION_KINDS)}")
     record = get_run(run_id)
     suggestion = _one_line(text)
     if not suggestion:
         raise RunError("suggestion text is empty")
     when = when or datetime.now(timezone.utc)
     why = _one_line(reason) or REASON_NONE
-    if any(item.get("text") == suggestion for item in record.get("rejected_suggestions", [])):
+    if any(item.get("text") == suggestion and item.get("kind", KIND_GLOBAL) == kind
+           for item in record.get("rejected_suggestions", [])):
         return False
+    label = "Rule" if kind == KIND_PERMISSION else "Suggestion"
     log = ensure_rejected_log()
     with log.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(
-            f"\n## {when:%Y-%m-%d} | {record['slug']} | global suggestion\n"
-            f"- Run: {run_id}\n- Suggestion: {suggestion}\n- Reason: {why}\n"
+            f"\n## {when:%Y-%m-%d} | {record['slug']} | {SUGGESTION_HEADINGS[kind]}\n"
+            f"- Run: {run_id}\n- {label}: {suggestion}\n- Reason: {why}\n"
         )
 
     def save(s: dict) -> None:
-        s["runs"][run_id].setdefault("rejected_suggestions", []).append(
-            {"text": suggestion, "reason": reason.strip() or REASON_NONE, "at": dstate.format_ts(when)}
-        )
+        entry = {"text": suggestion, "reason": reason.strip() or REASON_NONE, "at": dstate.format_ts(when)}
+        if kind != KIND_GLOBAL:
+            entry["kind"] = kind
+        s["runs"][run_id].setdefault("rejected_suggestions", []).append(entry)
 
     dstate.update_state(save)
     return True
@@ -1047,7 +1141,7 @@ def apply_run(run_id: str, only: list[int] | None = None, force: bool = False) -
 
 
 def discard_run(run_id: str, force: bool = False) -> list[RunChange]:
-    """Remove a run's worktree and delete its branch; the only place dream branches are deleted.
+    """Remove a run's worktree and delete its branch; with :func:`supersede_run` the only place dream branches are deleted.
 
     The worktree is removed with ``--force`` only if it is clean apart from the tool's own files (or
     ``force`` is given); otherwise the uncommitted work is protected. Changes that were neither applied
@@ -1058,10 +1152,26 @@ def discard_run(run_id: str, force: bool = False) -> list[RunChange]:
         RunError: unknown run, or the worktree holds uncommitted work and ``force`` is false.
     """
     record = get_run(run_id)
-    root = dstate.memory_root()
-    leftover = [] if record.get("status") == STATUS_DISCARDED else [
+    leftover = [] if record.get("status") in (STATUS_DISCARDED, STATUS_SUPERSEDED) else [
         c for c in run_changes(record) if not c.applied and not c.rejected
     ]
+    remove_checkout(record, force)
+    if leftover:
+        _record_rejections(run_id, record, leftover, REASON_DISCARDED, datetime.now(timezone.utc))
+    dstate.update_state(lambda s: dstate.set_run(s, run_id, status=STATUS_DISCARDED))
+    return leftover
+
+
+def remove_checkout(record: dict[str, Any], force: bool = False) -> None:
+    """Remove a run's worktree and delete its branch (shared by discard and supersede; changes no state).
+
+    The worktree is removed with ``--force`` only if it is clean apart from the tool's own files, or
+    ``force`` is given; otherwise the uncommitted work is protected.
+
+    Raises:
+        RunError: the worktree holds uncommitted work and ``force`` is false (nothing has been deleted).
+    """
+    root = dstate.memory_root()
     worktree = Path(record["worktree"]) if record.get("worktree") else None
     if worktree and worktree.exists():
         try:
@@ -1073,30 +1183,60 @@ def discard_run(run_id: str, force: bool = False) -> list[RunChange]:
     gitops.run_git(root, "worktree", "prune")
     if gitops.branch_exists(root, record["branch"]):
         gitops.delete_branch(root, record["branch"])
-    if leftover:
-        _record_rejections(run_id, record, leftover, REASON_DISCARDED, datetime.now(timezone.utc))
-    dstate.update_state(lambda s: dstate.set_run(s, run_id, status=STATUS_DISCARDED))
-    return leftover
+
+
+def supersede_run(run_id: str, by: str, log: RunLogger) -> bool:
+    """Retire an unreviewed run that the run ``by`` replaced; return False (with a warning) if it is left alone.
+
+    Removes its worktree and branch like ``discard`` does, marks it ``STATUS_SUPERSEDED`` with
+    ``superseded_by: by``, and does NOT log its leftover changes as rejected (accepted ones are live,
+    rejected ones are already logged, the rest are covered by the new run). A worktree with real
+    uncommitted work is never forced: the run stays as it was. A run that is no longer unreviewed
+    (applied or discarded meanwhile) is skipped silently.
+
+    Example::
+
+        supersede_run("proj-261105-0330", "proj-261106-0330", log)  # True
+    """
+    record = get_run(run_id)
+    if display_status(record) not in UNREVIEWED_STATUSES:
+        return False
+    try:
+        remove_checkout(record)
+    except (RunError, gitops.GitError) as exc:
+        log.warn(f"{run_id} not superseded by {by}: {exc}")
+        return False
+    dstate.update_state(lambda s: dstate.set_run(s, run_id, status=STATUS_SUPERSEDED, superseded_by=by))
+    log.info(f"superseded {run_id} (worktree and branch removed)")
+    return True
+
+
+def supersede_runs(run_ids: list[str], by: str, log: RunLogger) -> list[str]:
+    """Supersede each run in ``run_ids`` (see :func:`supersede_run`); return the ids that were superseded."""
+    return [run_id for run_id in run_ids if supersede_run(run_id, by, log)]
 
 
 # --------------------------------------------------------------------------- JSON views
 
-EXTRA_SECTIONS = ("global_suggestions", "stale_candidates", "not_acted_on")
+EXTRA_SECTIONS = ("global_suggestions", "stale_candidates", "not_acted_on", "permission_suggestions")
 _EXTRA_MATCHERS: dict[str, Callable[[str], bool]] = {
-    "global_suggestions": lambda title: "global" in title,
+    "global_suggestions": lambda title: "global" in title and "permission" not in title,
     "stale_candidates": lambda title: title.startswith("stale"),
     "not_acted_on": lambda title: "not_acted_on" in title,
+    "permission_suggestions": lambda title: "permission" in title and "global" not in title,
 }
 
 
 def pick_extras(sections: dict[str, str]) -> dict[str, str]:
-    """Map normalised ``## `` titles to the three report extras by keyword (headings vary in wording).
+    """Map normalised ``## `` titles to the report extras by keyword (headings vary in wording).
 
-    ``global_suggestions`` <- a title containing ``global``; ``stale_candidates`` <- one starting with
-    ``stale``; ``not_acted_on`` <- one containing ``not_acted_on``. The first match wins; missing -> ''.
+    ``global_suggestions`` <- a title containing ``global`` (but not ``permission``); ``stale_candidates``
+    <- one starting with ``stale``; ``not_acted_on`` <- one containing ``not_acted_on``;
+    ``permission_suggestions`` <- one containing ``permission`` (but not ``global``). The first match
+    wins; missing -> ''.
 
-    >>> pick_extras({"suggestions_for_global_claude_md": "g", "stale_candidates_unverified": "s"})
-    {'global_suggestions': 'g', 'stale_candidates': 's', 'not_acted_on': ''}
+    >>> pick_extras({"suggestions_for_global_claude_md": "g", "permission_suggestions": "p"})
+    {'global_suggestions': 'g', 'stale_candidates': '', 'not_acted_on': '', 'permission_suggestions': 'p'}
     """
     return {
         name: next((body for title, body in sections.items() if _EXTRA_MATCHERS[name](title)), "")
@@ -1119,12 +1259,17 @@ def run_to_json(run_id: str, record: dict[str, Any]) -> dict[str, Any]:
         "report_path": str(Path(record.get("run_dir", "")) / REPORT_NAME),
         "changes": len(record.get("commits", [])),
         "cost_usd": record.get("cost"),
+        **({"superseded_by": record["superseded_by"]} if record.get("superseded_by") else {}),
     }
 
 
 def run_detail_json(run_id: str, record: dict[str, Any]) -> dict[str, Any]:
     """Describe a run and each change (report section, capped diff, review flags) for ``show --json``.
 
+    ``report_extras`` holds the raw text of each extra section plus ``permission_suggestions_parsed``
+    (see :func:`permissions.parse_permission_suggestions`); ``permission_targets`` maps each suggestion
+    scope (``project-local``, ``project``, ``user``) to the settings file recorded when the run was made
+    (``{}`` for runs from before permissions existed); ``superseded_by`` appears for superseded runs.
     When ``state.json`` holds an ``update_notice`` (see ``STATE_UPDATE_NOTICE_KEY``) it is included at the
     top level so the review can mention that a newer to-dream is out.
     """
@@ -1143,12 +1288,18 @@ def run_detail_json(run_id: str, record: dict[str, Any]) -> dict[str, Any]:
             "diff": diff, "diff_truncated": truncated, "applied": change.applied, "rejected": change.rejected,
             "marked_applied": change.marked,
         })
+    picked = pick_extras(extras)
     detail = {
         **{key: summary[key] for key in ("run_id", "slug", "status", "report_path", "worktree", "branch",
                                          "base_branch")},
+        **({"superseded_by": summary["superseded_by"]} if "superseded_by" in summary else {}),
         "live_memory_dir": str(root / str(record.get("slug", "")) / MEMORY_DIRNAME),
         "changes": changes,
-        "report_extras": pick_extras(extras),
+        "report_extras": {
+            **picked, "permission_suggestions_parsed": permissions.parse_permission_suggestions(
+                picked["permission_suggestions"]),
+        },
+        "permission_targets": record.get("permission_targets", {}),
     }
     notice = dstate.load_state().get(STATE_UPDATE_NOTICE_KEY)
     if notice:

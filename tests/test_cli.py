@@ -378,8 +378,16 @@ class JsonOutputTests(CliCase):
             "global_suggestions": "Consider a global note about tabs.",
             "stale_candidates": "- a.md may be stale",
             "not_acted_on": "- nothing else",
+            "permission_suggestions": "",
+            "permission_suggestions_parsed": [],
+        })
+        self.assertEqual(data["permission_targets"], {
+            "project-local": (self.project_dir / ".claude" / "settings.local.json").as_posix(),
+            "project": (self.project_dir / ".claude" / "settings.json").as_posix(),
+            "user": (self.root.parent / "settings.json").as_posix(),
         })
         self.assertNotIn("update_notice", data)
+        self.assertNotIn("superseded_by", data)
 
     def test_show_json_includes_the_update_notice_when_state_has_one(self):
         summary = self.dream()
@@ -405,7 +413,10 @@ class JsonOutputTests(CliCase):
         data = load_json(self.call("show", summary.run_id, "--json"))
         self.assertEqual([(c["applied"], c["rejected"]) for c in data["changes"]],
                          [(True, False), (False, True), (False, False)])
-        self.assertEqual(data["report_extras"], {"global_suggestions": "", "stale_candidates": "", "not_acted_on": ""})
+        self.assertEqual(data["report_extras"], {
+            "global_suggestions": "", "stale_candidates": "", "not_acted_on": "", "permission_suggestions": "",
+            "permission_suggestions_parsed": [],
+        })
 
     def test_diff_is_capped_and_flagged(self):
         big = "x" * 20000 + "\n"
@@ -569,6 +580,69 @@ class MarkAppliedAndSuggestionCommandTests(CliCase):
         self.assertEqual(self.call("reject-suggestion", "nope", "--text", "x")[0], 2)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             cli.build_parser().parse_args(["reject-suggestion", summary.run_id])  # --text is required
+
+    def test_reject_suggestion_kind_permission(self):
+        summary = self.dream()
+        code, out, err = self.call("reject-suggestion", summary.run_id, "--kind", "permission",
+                                   "--text", "Bash(npm test *)", "--reason", "too broad")
+        self.assertEqual(code, 0, err)
+        self.assertIn("recorded the rejected permission suggestion", out)
+        text = self.log_text()
+        self.assertRegex(text, rf"## \d{{4}}-\d{{2}}-\d{{2}} \| {self.slug} \| permission suggestion")
+        self.assertIn("- Rule: Bash(npm test *)", text)
+        self.assertIn("- Reason: too broad", text)
+        self.assertNotIn("| global suggestion", text)
+        self.assertIn("already recorded", self.call(
+            "reject-suggestion", summary.run_id, "--kind", "permission", "--text", "Bash(npm test *)")[1])
+        # the same words as a global suggestion are a different entry
+        self.assertIn("recorded the rejected global suggestion",
+                      self.call("reject-suggestion", summary.run_id, "--text", "Bash(npm test *)")[1])
+        self.assertEqual(self.log_text().count("\n## "), 2)
+
+    def test_reject_suggestion_rejects_an_unknown_kind(self):
+        summary = self.dream()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(["reject-suggestion", summary.run_id, "--text", "x", "--kind", "other"])
+
+    def test_show_json_parses_permission_suggestions_from_the_report(self):
+        report = REPORT + (
+            "\n## Permission suggestions\n"
+            "- **Rule:** `Bash(npm test *)` · **Kind:** allow · **Scope:** project-local\n"
+            "  - **Evidence:** s0.md L12, L40 · blocked 4×, approved after block 3× in 2 sessions\n"
+            "  - **Risk:** runs the project's own tests\n"
+            "  - **Why:** prompted in every session\n"
+        )
+        summary = self.dream(**dict(HAPPY, report=report))
+        extras = load_json(self.call("show", summary.run_id, "--json"))["report_extras"]
+        self.assertEqual(extras["permission_suggestions_parsed"], [{
+            "rule": "Bash(npm test *)", "kind": "allow", "scope": "project-local",
+            "evidence": "s0.md L12, L40 · blocked 4×, approved after block 3× in 2 sessions",
+            "risk": "runs the project's own tests", "why": "prompted in every session",
+        }])
+        self.assertIn("**Rule:** `Bash(npm test *)`", extras["permission_suggestions"])
+        self.assertEqual(extras["global_suggestions"], "Consider a global note about tabs.")
+
+    def test_superseded_run_is_listed_with_its_replacement(self):
+        first = self.dream()
+        self.plan(report="# none\n")
+        second = runner.run_project(self.slug, runner.RunOptions(), now=NOW + timedelta(days=1), echo=False)
+        rows = {r["run_id"]: r for r in load_json(self.call("list", "--json"))}
+        self.assertEqual(rows[first.run_id]["status"], "superseded")
+        self.assertEqual(rows[first.run_id]["superseded_by"], second.run_id)
+        self.assertNotIn("superseded_by", rows[second.run_id])
+        self.assertEqual(load_json(self.call("show", first.run_id, "--json"))["superseded_by"], second.run_id)
+        code, _, err = self.call("apply", first.run_id)
+        self.assertEqual(code, 2)
+        self.assertIn("superseded", err)
+
+    def test_summary_names_the_superseded_runs(self):
+        first = self.dream()
+        self.plan(**HAPPY)
+        second = runner.run_project(self.slug, runner.RunOptions(), now=NOW + timedelta(days=1), echo=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.print_summary(second)
+        self.assertIn(f"superseded earlier unreviewed run(s): {first.run_id}", out.getvalue())
 
 
 class ApplyOutputTests(CliCase):

@@ -10,6 +10,8 @@ You run headless. Nobody will answer questions. Don't ask for anything. Do the w
 - The user's global instructions: `{{global_claude_md}}`. Read it, but don't edit it.
 - Steering, which says what matters to this user: `{{steering_path}}`. Read it first. It overrides any defaults below that conflict with it.
 - Previously rejected proposals: `{{rejected_log}}`. The user turned these down in earlier reviews; entries headed "global suggestion" are rejected suggestions for the global CLAUDE.md. Don't propose the same change or suggestion again unless there's clearly new evidence. If you do, say so in the change's **Why:** line and cite that new evidence.
+- Roll-up: {{rollup_note}}
+- The project's current permission rules (only the `permissions` object of each settings file) and the absolute path of the settings file each suggestion scope edits: `{{permissions_path}}`. Read it; don't edit it.
 - Write your report to `{{report_path}}`.
 
 Each digest is a compressed transcript of one session or subagent. It contains the human's prompts, the human's corrections (tagged **CORRECTION**), tool errors, denials and hook blocks (tagged **DENIED**), repeated failures, and the memory files the session itself wrote. Every entry has an `L<n>` reference to a line in the source transcript. Cite those references as evidence.
