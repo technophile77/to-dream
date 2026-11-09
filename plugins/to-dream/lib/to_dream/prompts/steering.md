@@ -9,7 +9,7 @@ This file tells the dreaming job what's worth remembering for this user. To cust
 - **Failure recipes.** Errors that kept recurring, paired with the fix or workaround that worked.
 - **Domain rules the user taught.** Business or product rules, decisions and their reasons, which aren't written down in the code.
 - **Where secrets live.** For example "the key is in the secrets manager under …". Never the secret itself.
-- **Permission friction.** Calls the user keeps having to approve by hand, or keeps having to stop. These become suggested permission rules in the report, not memories.
+- **Permission friction.** (Applies only when the config key `permissions_review` is on; it is off by default. Otherwise ignore this bullet.) Calls the user keeps having to approve by hand, or keeps having to stop. These become suggested permission rules in the report, not memories.
 
 ## Not worth remembering
 

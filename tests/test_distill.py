@@ -658,6 +658,29 @@ class PermissionEventTests(DistillCase):
             for event in digest.permission_events:
                 self.assertNotIn(secret, repr(event))
 
+    def test_permissions_review_off_drops_the_sections_but_keeps_inline_tags(self):
+        records = [
+            user("start", 0, permissionMode="auto"),
+            tool_use("t1", CHROME, {"reqid": 4}, 1),
+            blocked_result("t1", minutes=2),
+            user("manual permissions, do the read again", 3, permissionMode="acceptEdits"),
+            tool_use("t2", CHROME, {"reqid": 4}, 4),
+            tool_result("t2", "{...}", is_error=False, minutes=5),
+        ]
+        digest, text = self.run_one(records, permissions_review=False)
+        self.assertNotIn("## Permission events", text)
+        self.assertIn("## Repeated failures", text)
+        self.assertEqual([e[2] for e in entries_of(text) if e[2].startswith("**") and e[2] != "**CORRECTION**"],
+                         ["**BLOCKED**", "**APPROVED-AFTER-BLOCK**"])
+        self.assertEqual((digest.blocked, digest.approved_after_block, len(digest.permission_events)), (1, 1, 2))
+        index = distill.write_index([digest], self.out, permissions_review=False).read_text(encoding="utf-8")
+        self.assertNotIn("Permission events", index)
+        self.assertNotIn(distill.PERMISSION_TABLE_HEADER, index)
+        self.assertIn("**Totals:**", index)
+        with_review = distill.write_index([digest], self.out).read_text(encoding="utf-8")
+        self.assertIn("## Permission events (all sessions)", with_review)
+        self.assertIn(distill.PERMISSION_TABLE_HEADER, with_review)
+
     def test_subagent_permission_events_are_digested(self):
         path = write_jsonl(self.project / "bbbbbbbb-2222" / "subagents" / "agent-abcdef123456.jsonl", [
             tool_use("t", "Bash", {"command": "cat .env"}, 0), blocked_result("t", minutes=1),

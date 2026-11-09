@@ -13,8 +13,10 @@ Thanks for helping. to-dream is Python 3.10+, standard library only, and must wo
 
 ## Releasing
 
-1. Bump `version` in `plugins/to-dream/.claude-plugin/plugin.json` (the only place; don't add a version to `marketplace.json`).
-2. Add a `CHANGELOG.md` entry.
+Every PR that changes code bumps the version, so each merge to the default branch is a release that installed copies can update to. Docs-only PRs don't bump. Use semver: a fix is a patch bump, a new feature or option is a minor bump, and a breaking change is a major bump (while the version is below 1.0, a minor bump).
+
+1. In the PR, bump `version` in `plugins/to-dream/.claude-plugin/plugin.json` (the only place; don't add a version to `marketplace.json`).
+2. In the PR, turn the `CHANGELOG.md` "Unreleased" entries into a section for the new version.
 3. Run the tests and both `claude plugin validate` commands.
 4. Merge to the default branch, then tag the commit `to-dream--v<version>` (Claude Code's plugin tag convention), for example `to-dream--v0.2.0`.
 

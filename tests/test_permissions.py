@@ -1,5 +1,6 @@
 import json
 import random
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,7 @@ from helpers import new_seed
 from test_runner import HAPPY, NOW, SECRET
 from to_dream_helpers import DreamTestCase
 
-from to_dream import permissions, runner, state as dstate
+from to_dream import config, permissions, runner, state as dstate
 
 # Never read by to-dream; assembled at runtime so no key-shaped literal sits in the file.
 ENV_TOKEN = "ghp_" + "Zz9yX8wV7uT6sR5qP4oN3mL2kJ1iH0gF9eD8"
@@ -138,6 +139,7 @@ class SettingsReadingTests(unittest.TestCase):
 class PermissionsFileTests(DreamTestCase):
     def setUp(self):
         super().setUp()
+        config.set_value("permissions_review", True)
         self.project_dir.mkdir(parents=True)
         self.user_file = self.root.parent / "settings.json"
         self.shared = self.project_dir / ".claude" / "settings.json"
@@ -272,6 +274,157 @@ class PermissionsFileTests(DreamTestCase):
         dstate.update_state(lambda s: dstate.set_run(s, summary.run_id, permission_targets=recorded))
         data = runner.run_detail_json(summary.run_id, runner.get_run(summary.run_id))
         self.assertEqual(data["permission_targets"], recorded)
+
+
+START = "<!-- permissions-review:start -->"
+END = "<!-- permissions-review:end -->"
+ALL_VALUES = {name: f"<{name}>" for name in runner.PLACEHOLDERS}
+PERMISSION_PASSAGES = (
+    "Review permission friction", "## Permission suggestions", "Permission friction**:", "`<permissions_path>`", "permission suggestion", "permission rules suggested", "The index ends with a table",
+    "Permission suggestions are therefore", "Don't propose rules; report the facts",
+)
+
+
+def step_numbers(prompt: str) -> list[str]:
+    """List the numbers of the ``### <n>. ...`` process steps of a rendered prompt, in order."""
+    return re.findall(r"(?m)^### (\d+[a-z]?)\. ", prompt)
+
+
+class PromptMarkerTests(unittest.TestCase):
+    """The bundled orchestrator prompt with the permissions review switched off and on."""
+
+    def setUp(self):
+        self.template = runner.ORCHESTRATOR_PROMPT.read_text(encoding="utf-8")
+
+    def render(self, enabled: bool) -> str:
+        return runner.render_prompt(self.template, ALL_VALUES, enabled)
+
+    def test_off_has_no_permission_review_passages_and_no_markers(self):
+        text = self.render(False)
+        self.assertNotIn("permissions-review", text)
+        for passage in PERMISSION_PASSAGES:
+            with self.subTest(passage=passage):
+                self.assertNotIn(passage, text)
+        self.assertNotIn("category 7", text)
+        self.assertNotIn("\n\n\n", text)
+
+    def test_on_has_the_passages_and_no_markers(self):
+        text = self.render(True)
+        self.assertNotIn("permissions-review", text)
+        for passage in PERMISSION_PASSAGES:
+            with self.subTest(passage=passage):
+                self.assertIn(passage, text)
+        self.assertNotIn("\n\n\n", text)
+
+    def test_step_numbering_reads_correctly_in_both_modes(self):
+        self.assertEqual(step_numbers(self.render(False)), ["1", "2", "3", "4", "5", "6", "7"])
+        self.assertEqual(step_numbers(self.render(True)), ["1", "2", "3", "4", "4b", "5", "6", "7"])
+
+    def test_off_keeps_the_digest_tag_description_and_everything_else(self):
+        off, on = self.render(False), self.render(True)
+        for kept in ("**BLOCKED**", "**APPROVED-AFTER-BLOCK**", "**INTERRUPTED**", "## Stale candidates (unverified)",
+                     "## Suggestions for global CLAUDE.md"):
+            self.assertIn(kept, off)
+        self.assertLess(len(off), len(on))
+
+    def test_unknown_placeholders_fail_in_both_modes_even_inside_a_dropped_block(self):
+        template = f"{START}\n{{{{nope}}}}\n{END}\nx\n"
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), self.assertRaises(runner.TemplateError):
+                runner.render_prompt(template, ALL_VALUES, enabled)
+
+    def test_permissions_path_needs_no_value_when_off(self):
+        values = {k: v for k, v in ALL_VALUES.items() if k != "permissions_path"}
+        runner.render_prompt(self.template, values, False)
+        with self.assertRaises(runner.TemplateError):
+            runner.render_prompt(self.template, values, True)
+
+    def test_marker_cases(self):
+        cases = [
+            (f"a\n{START}\nb\n{END}\nc\n", "a\nc\n", "a\nb\nc\n"),
+            (f"x{START} y{END} z\n", "x z\n", "x y z\n"),
+            (f"{START}\n{END}\nq\n", "q\n", "q\n"),
+            ("no markers\n", "no markers\n", "no markers\n"),
+        ]
+        for template, off, on in cases:
+            with self.subTest(template=template):
+                self.assertEqual(runner.apply_permissions_review(template, False), off)
+                self.assertEqual(runner.apply_permissions_review(template, True), on)
+
+    def test_random_templates_keep_all_unmarked_text(self):
+        seed = new_seed()
+        print(f"[test_random_templates_keep_all_unmarked_text] seed={seed}")
+        rng = random.Random(seed)
+        words = ["alpha", "beta", "{{slug}}", "## head", "> quote", "- item", "tail."]
+
+        def line() -> str:
+            return " ".join(rng.choice(words) for _ in range(rng.randint(1, 4)))
+
+        for _ in range(200):
+            template, off, on = [], [], []
+            for _ in range(rng.randint(1, 12)):
+                kind = rng.choice(["plain", "block", "inline"])
+                if kind == "plain":
+                    text = line() + "\n"
+                    template.append(text), off.append(text), on.append(text)
+                elif kind == "block":
+                    body = "".join(line() + "\n" for _ in range(rng.randint(0, 3)))
+                    template.append(f"{START}\n{body}{END}\n"), on.append(body)
+                else:
+                    head, mid, tail = line(), " " + line(), line()
+                    template.append(f"{head}{START}{mid}{END} {tail}\n")
+                    off.append(f"{head} {tail}\n"), on.append(f"{head}{mid} {tail}\n")
+            self.assertEqual(runner.apply_permissions_review("".join(template), False), "".join(off))
+            self.assertEqual(runner.apply_permissions_review("".join(template), True), "".join(on))
+
+
+class PermissionsReviewRunTests(DreamTestCase):
+    def dream(self):
+        self.plan(**HAPPY)
+        return runner.run_project(self.slug, runner.RunOptions(), now=NOW, echo=False)
+
+    def allowed_and_denied(self) -> tuple[list[str], list[str]]:
+        argv = self.claude_call()["argv"]
+        allowed = argv[argv.index("--allowedTools") + 1: argv.index("--disallowedTools")]
+        return allowed, argv[argv.index("--disallowedTools") + 1: argv.index("--add-dir")]
+
+    def test_off_by_default_writes_no_permissions_file_and_no_targets(self):
+        self.project_dir.mkdir(parents=True)
+        summary = self.dream()
+        self.assertFalse((summary.run_dir / "permissions.md").exists())
+        self.assertEqual(runner.get_run(summary.run_id)["permission_targets"], {})
+        call = self.claude_call()
+        self.assertFalse([a for a in self.allowed_and_denied()[0] if "permissions.md" in a])
+        for passage in PERMISSION_PASSAGES:
+            self.assertNotIn(passage, call["stdin"])
+        self.assertNotIn("permissions-review", call["stdin"])
+        self.assertEqual(self.distill.calls[-1]["permissions_review"], False)
+        self.assertEqual(self.distill.index_permissions_review, False)
+
+    def test_off_still_denies_reading_the_settings_files(self):
+        self.project_dir.mkdir(parents=True)
+        self.dream()
+        denied = self.allowed_and_denied()[1]
+        self.assertEqual(denied[:4], ["Bash", "PowerShell", "WebFetch", "WebSearch"])
+        for name in ("settings.json", "settings.local.json"):
+            with self.subTest(settings=name):
+                self.assertTrue([rule for rule in denied
+                                 if rule.startswith("Read(") and rule.endswith(f"/st-timelines/.claude/{name})")])
+        self.assertTrue([rule for rule in denied if rule.endswith("/.claude/settings.json)")])
+
+    def test_on_writes_the_file_records_targets_and_prompts_for_suggestions(self):
+        config.set_value("permissions_review", True)
+        self.project_dir.mkdir(parents=True)
+        summary = self.dream()
+        self.assertTrue((summary.run_dir / "permissions.md").is_file())
+        self.assertEqual(sorted(runner.get_run(summary.run_id)["permission_targets"]),
+                         ["project", "project-local", "user"])
+        call = self.claude_call()
+        self.assertIn(runner.read_rule(summary.run_dir / "permissions.md"), self.allowed_and_denied()[0])
+        self.assertIn("## Permission suggestions", call["stdin"])
+        self.assertIn((summary.run_dir / "permissions.md").as_posix(), call["stdin"])
+        self.assertNotIn("permissions-review", call["stdin"])
+        self.assertEqual(self.distill.calls[-1]["permissions_review"], True)
 
 
 if __name__ == "__main__":

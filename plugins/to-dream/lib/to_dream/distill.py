@@ -784,11 +784,21 @@ def _permission_lines(events: Iterable[PermissionEvent]) -> list[str]:
     return [_permission_line(row) for row in rows[:PERMISSION_ROWS]]
 
 
-def _compose(header: list[str], timeline: list[str], repeats: list[str], permissions: list[str]) -> str:
-    """Assemble header, timeline, repeated-failure and permission-event sections into the digest body."""
+def _compose(
+    header: list[str], timeline: list[str], repeats: list[str], permissions: list[str] | None,
+) -> str:
+    """Assemble header, timeline, repeated-failure and permission-event sections into the digest body.
+
+    ``permissions`` None leaves out the "## Permission events" section (the permissions review is off);
+    an empty list renders it as ``(none)``.
+
+    >>> _compose(["# h"], [], [], None).endswith("## Repeated failures\\n(none)\\n")
+    True
+    """
     parts = [*header, "", "## Timeline", *(timeline or ["(no events)"]), "", "## Repeated failures"]
     parts += repeats or ["(none)"]
-    parts += ["", "## Permission events", *(permissions or ["(none)"])]
+    if permissions is not None:
+        parts += ["", "## Permission events", *(permissions or ["(none)"])]
     return "\n".join(parts) + "\n"
 
 
@@ -827,6 +837,7 @@ def distill_transcript(
     memory_root: Path,
     max_chars: int = 20000,
     stats: DistillStats | None = None,
+    permissions_review: bool = True,
 ) -> SessionDigest | None:
     """Stream one transcript and write its digest into out_dir; None if there is nothing to report.
 
@@ -843,6 +854,9 @@ def distill_transcript(
         memory_root: the projects root (``~/.claude/projects``) used to recognise memory writes.
         max_chars: upper bound for the digest body, in characters.
         stats: optional counters, updated with this file's contribution (see :class:`DistillStats`).
+        permissions_review: write the "## Permission events" section (config ``permissions_review``).
+            The inline BLOCKED / APPROVED-AFTER-BLOCK / INTERRUPTED / DENIED tags and the digest's
+            ``permission_events`` are kept either way.
 
     Example::
 
@@ -868,7 +882,7 @@ def distill_transcript(
         return None
     meta = _read_meta(path) if is_sub else {}
     repeats = _repeat_lines(col.failures)
-    permissions = _permission_lines(col.events)
+    permissions = _permission_lines(col.events) if permissions_review else None
     fixed = len(_compose(_header(ident, path, is_sub, col, meta, col.title, Counter()), [], repeats, permissions))
     kept, dropped = trim_entries(col.entries, max_chars - fixed - NOTE_RESERVE)
     header = _header(ident, path, is_sub, col, meta, col.title, dropped)
@@ -904,10 +918,12 @@ def distill_project(
     max_chars: int = 20000,
     max_sessions: int | None = None,
     stats: DistillStats | None = None,
+    permissions_review: bool = True,
 ) -> list[SessionDigest]:
     """Distil every transcript of a project into out_dir and return digests, newest first.
 
-    With ``max_sessions`` only the most recent N (by last timestamp) are kept; files are read in
+    ``permissions_review`` is passed to :func:`distill_transcript` (False omits the per-digest
+    "## Permission events" section). With ``max_sessions`` only the most recent N (by last timestamp) are kept; files are read in
     modification-time order and reading stops once no remaining file can be newer than the Nth,
     and digest files of the others are not left behind. Pass ``stats`` to learn whether any record
     of the transcripts read could be parsed at all (:class:`DistillStats`).
@@ -925,7 +941,7 @@ def distill_project(
             nth = sorted(map(_sort_key, digests), reverse=True)[max_sessions - 1]
             if datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) < nth:
                 break
-        digest = distill_transcript(path, out_dir, since, until, memory_root, max_chars, stats)
+        digest = distill_transcript(path, out_dir, since, until, memory_root, max_chars, stats, permissions_review)
         if digest is not None:
             digests.append(digest)
     digests.sort(key=_sort_key, reverse=True)
@@ -963,11 +979,13 @@ def _permission_table(rows: list[PermissionSummary]) -> list[str]:
     return lines
 
 
-def write_index(digests: list[SessionDigest], out_dir: Path) -> Path:
+def write_index(digests: list[SessionDigest], out_dir: Path, permissions_review: bool = True) -> Path:
     """Write ``INDEX.md`` (newest first table of digests with counts and totals) and return its path.
 
-    A final "## Permission events (all sessions)" table aggregates the digests' permission events
-    per tool call (:func:`aggregate_permission_events`); its header row is ``PERMISSION_TABLE_HEADER``.
+    With ``permissions_review`` (config ``permissions_review``) a final "## Permission events (all
+    sessions)" table aggregates the digests' permission events per tool call
+    (:func:`aggregate_permission_events`); its header row is ``PERMISSION_TABLE_HEADER``. Without it the
+    table is left out.
 
     Example::
 
@@ -1000,8 +1018,9 @@ def write_index(digests: list[SessionDigest], out_dir: Path) -> Path:
         "# Digest index", "",
         f"{len(ordered)} digests ({sum(d.is_subagent for d in ordered)} subagent).", "", *rows, "",
         "**Totals:** " + ", ".join(f"{k}={v}" for k, v in totals.items()),
-        "", "## Permission events (all sessions)", "", *_permission_table(aggregate_permission_events(ordered)),
     ]
+    if permissions_review:
+        lines += ["", "## Permission events (all sessions)", "", *_permission_table(aggregate_permission_events(ordered))]
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / "INDEX.md"
     target.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")

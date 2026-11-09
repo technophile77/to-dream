@@ -44,17 +44,18 @@ class StubDistill:
         self.calls: list[dict] = []
 
     def distill_project(self, project_dir, out_dir, since=None, until=None, max_chars=20000, max_sessions=None,
-                        stats=None):
+                        stats=None, permissions_review=True):
         """Record the call, write one digest file per session and return the digests."""
         self.calls.append({"project_dir": project_dir, "out_dir": out_dir, "since": since, "until": until,
-                           "max_sessions": max_sessions})
+                           "max_sessions": max_sessions, "permissions_review": permissions_review})
         digests = [StubDigest(f"s{i}") for i in range(self.count)]
         for d in digests:
             (Path(out_dir) / f"{d.session_id}.md").write_text("digest\n", encoding="utf-8")
         return digests
 
-    def write_index(self, digests, out_dir):
+    def write_index(self, digests, out_dir, permissions_review=True):
         """Write and return a trivial INDEX.md."""
+        self.index_permissions_review = permissions_review
         path = Path(out_dir) / "INDEX.md"
         path.write_text("\n".join(d.session_id for d in digests), encoding="utf-8")
         return path

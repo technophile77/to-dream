@@ -349,7 +349,12 @@ class JsonOutputTests(CliCase):
             [r["status"] for r in load_json(self.call("list", "--json"))], ["discarded", "no-changes", "failed"]
         )
 
+    def test_show_json_permission_targets_are_empty_while_the_review_is_off(self):
+        summary = self.dream()
+        self.assertEqual(load_json(self.call("show", summary.run_id, "--json"))["permission_targets"], {})
+
     def test_show_json(self):
+        config.set_value("permissions_review", True)
         summary = self.dream()
         data = load_json(self.call("show", summary.run_id, "--json"))
         self.assertEqual(

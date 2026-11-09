@@ -87,6 +87,8 @@ From the `report_extras` of each run's `show` output. With several runs, show a 
 
 ## 6. Permission suggestions
 
+Permission suggestions appear only when the config key `permissions_review` is on (it is off by default; enable it with `to-dream config set permissions_review true`). If the report has no permission suggestions (none, or the section is absent), skip this step and leave permission counts out of the step 7 summary.
+
 Use `report_extras.permission_suggestions_parsed`, a list of objects with `rule`, `kind` (`allow` or `ask`), `scope`, `evidence`, `risk` and `why`. If it's empty but `report_extras.permission_suggestions` has text other than "None.", fall back to reading that raw text. The settings file each scope edits is in `permission_targets` (`project-local`, `project`, `user` map to absolute paths; a file may not exist yet). If `permission_targets` is empty or lacks the scope (an older run, or an unknown project directory), ask the user for the file.
 
 Ask one question per suggestion, up to 4 per AskUserQuestion call. Each question has to stand alone: it states the rule, what it does in plain words, the evidence counts and the risk.
@@ -112,4 +114,4 @@ Recommend **Reject** instead (put it first and say why) for broad rules, for any
 ## 7. Finish
 
 - If no decisions are left pending in a run, ask whether to clean up the run with `to-dream discard <run-id>`. Discarding removes the proposal branch and worktree, and records any leftover changes as rejected. Only discard if the user says yes. With several runs reviewed, offer this for each finished run.
-- End with a summary: accepted (n), edited (n), rejected (n), still pending (n), permission rules added (n, with the scope of each) and rejected (n), and whether each run was cleaned up. Nothing is pushed anywhere; accepted changes are commits on the user's local memory repo only, and permission rules are written only to the settings files the user chose.
+- End with a summary: accepted (n), edited (n), rejected (n), still pending (n), permission rules added (n, with the scope of each) and rejected (n) (only if there were permission suggestions), and whether each run was cleaned up. Nothing is pushed anywhere; accepted changes are commits on the user's local memory repo only, and permission rules are written only to the settings files the user chose.

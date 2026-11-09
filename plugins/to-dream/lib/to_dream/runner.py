@@ -63,6 +63,12 @@ PLACEHOLDERS = frozenset(
     }
 )
 _PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}")
+_PERMISSIONS_START = r"<!-- permissions-review:start -->"
+_PERMISSIONS_END = r"<!-- permissions-review:end -->"
+_PERMISSIONS_MARKER = re.compile(f"{_PERMISSIONS_START}|{_PERMISSIONS_END}")
+_PERMISSIONS_MARKER_LINE = re.compile(rf"^(?:{_PERMISSIONS_START}|{_PERMISSIONS_END})[ \t]*\n", re.MULTILINE)
+_PERMISSIONS_LINE_BLOCK = re.compile(rf"^{_PERMISSIONS_START}[ \t]*\n.*?^{_PERMISSIONS_END}[ \t]*\n", re.DOTALL | re.MULTILINE)
+_PERMISSIONS_INLINE_BLOCK = re.compile(f"{_PERMISSIONS_START}.*?{_PERMISSIONS_END}", re.DOTALL)
 _DRIVE_PREFIX = re.compile(r"^[a-z]--", re.IGNORECASE)
 _UNSAFE_DIRNAME = re.compile(r'[\\/:*?"<>|\s]+')
 
@@ -379,6 +385,42 @@ def render_template(template: str, values: dict[str, str]) -> str:
     return _PLACEHOLDER.sub(lambda m: values[m.group(1)], template)
 
 
+def apply_permissions_review(template: str, enabled: bool) -> str:
+    """Resolve the ``permissions-review`` marker comments of a prompt template.
+
+    Passages wrapped in ``<!-- permissions-review:start -->`` / ``<!-- permissions-review:end -->`` are
+    kept (markers removed) when ``enabled`` and dropped entirely (markers included) otherwise. A pair on
+    their own lines drops those whole lines; a pair inside a line drops only the text between them.
+
+    >>> apply_permissions_review("a\\n<!-- permissions-review:start -->\\nb\\n<!-- permissions-review:end -->\\nc\\n", False)
+    'a\\nc\\n'
+    >>> apply_permissions_review("x<!-- permissions-review:start --> y<!-- permissions-review:end --> z", True)
+    'x y z'
+    """
+    if enabled:
+        return _PERMISSIONS_MARKER.sub("", _PERMISSIONS_MARKER_LINE.sub("", template))
+    return _PERMISSIONS_INLINE_BLOCK.sub("", _PERMISSIONS_LINE_BLOCK.sub("", template))
+
+
+def render_prompt(template: str, values: dict[str, str], permissions_review: bool) -> str:
+    """Resolve the permissions-review markers (:func:`apply_permissions_review`), then fill the placeholders.
+
+    Unknown placeholders fail in both modes, even inside a passage that is dropped. In the dropped
+    mode ``permissions_path`` needs no value.
+
+    >>> render_prompt("<!-- permissions-review:start -->{{permissions_path}}<!-- permissions-review:end -->{{slug}}",
+    ...               {"slug": "p"}, False)
+    'p'
+
+    Raises:
+        TemplateError: see :func:`render_template`.
+    """
+    unknown = sorted(set(_PLACEHOLDER.findall(template)) - PLACEHOLDERS)
+    if unknown:
+        raise TemplateError(f"unknown placeholder(s) in prompt template: {', '.join(unknown)}")
+    return render_template(apply_permissions_review(template, permissions_review), values)
+
+
 def steering_path(cfg: dict[str, Any] | None = None) -> Path:
     """Pick the steering file: config ``steering_path``, else ``$TO_DREAM_HOME/steering.md``, else the bundled one.
 
@@ -417,11 +459,13 @@ def ensure_rejected_log() -> Path:
 def build_prompt_values(
     slug: str, memory_dir: Path, run_dir: Path, index: Path, project_dir: str | None,
     options: RunOptions, since: datetime, until: datetime, session_count: int, steering: Path,
-    permissions_path: Path, note: str = NO_ROLLUP_NOTE,
+    permissions_path: Path | None, note: str = NO_ROLLUP_NOTE,
 ) -> dict[str, str]:
     """Collect the value of every placeholder of the orchestrator prompt.
 
-    ``permissions_path`` is the run's ``permissions.md``; ``note`` is the :func:`rollup_note` text.
+    ``permissions_path`` is the run's ``permissions.md``, or None when the permissions review is off
+    (config ``permissions_review``; the placeholder is then empty and unused); ``note`` is the
+    :func:`rollup_note` text.
     """
     return {
         "slug": slug,
@@ -439,7 +483,7 @@ def build_prompt_values(
         "session_count": str(session_count),
         "rejected_log": _posix(ensure_rejected_log()),
         "rollup_note": note,
-        "permissions_path": _posix(permissions_path),
+        "permissions_path": _posix(permissions_path) if permissions_path else "",
     }
 
 
@@ -734,8 +778,10 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
     Roll-up: with config ``rollup`` on (default) and unreviewed runs of the project present, the window starts
     at the earliest of their ``window_since`` and the normal start; once the new run succeeds (pending,
     no-changes or needs-attention) those runs are superseded (``RunSummary.superseded``). A failed run
-    leaves them untouched. ``permissions.md`` (the current permission rules) is written into the run dir, and
-    Claude is denied reading the settings files themselves (:func:`settings_deny_rules`).
+    leaves them untouched. With config ``permissions_review`` on (default off), ``permissions.md`` (the
+    current permission rules) is written into the run dir, the prompt asks for permission suggestions and the
+    digests carry the permission-event sections; off, none of that happens and ``permission_targets`` is
+    ``{}``. Either way Claude is denied reading the settings files themselves (:func:`settings_deny_rules`).
 
     Raises:
         PreflightError: environment unusable (see :func:`preflight`).
@@ -768,7 +814,7 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
     distill_stats = distill.DistillStats() if hasattr(distill, "DistillStats") else None
     digests = distill.distill_project(
         root / slug, run_dir / "digests", since=since, until=until, max_sessions=options.max_sessions,
-        stats=distill_stats,
+        stats=distill_stats, permissions_review=cfg["permissions_review"],
     )
     if not digests:
         drifted = bool(distill_stats and distill_stats.format_changed)
@@ -780,7 +826,7 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
                               message=FORMAT_DRIFT_MESSAGE, base_branch=base_branch)
         return RunSummary(run_id, slug, STATUS_NO_SESSIONS, run_dir, message="no sessions in window",
                           base_branch=base_branch)
-    index = distill.write_index(digests, run_dir / "digests")
+    index = distill.write_index(digests, run_dir / "digests", permissions_review=cfg["permissions_review"])
     stats = digest_stats(digests)
     log.info(f"distilled {len(digests)} session(s) -> {index}")
     if options.dry_run:
@@ -788,7 +834,10 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
                           session_count=len(digests), warnings=tuple(log.warnings), base_branch=base_branch)
 
     project_dir = distill.project_cwd(digests)
-    permissions_file, targets = permissions.write_permissions(run_dir, slug, project_dir)
+    permissions_file: Path | None = None
+    targets: dict[str, Any] = {}
+    if cfg["permissions_review"]:
+        permissions_file, targets = permissions.write_permissions(run_dir, slug, project_dir)
     worktree = worktree_path(cfg, short, run_id, local_now)
     base = _prepare_branch(root, run_id, run_dir, base_branch, branch, worktree, log)
     memory_dir = worktree / slug / MEMORY_DIRNAME
@@ -801,14 +850,15 @@ def run_project(slug: str, options: RunOptions, now: datetime | None = None, ech
         permission_targets=targets,
     ))
 
-    prompt = render_template(
+    prompt = render_prompt(
         ORCHESTRATOR_PROMPT.read_text(encoding="utf-8"),
         build_prompt_values(slug, memory_dir, run_dir, index, project_dir, options, since, until, len(digests),
                             steering, permissions_file, rollup_note(unreviewed)),
+        cfg["permissions_review"],
     )
     (run_dir / "prompt.md").write_text(prompt, encoding="utf-8")
-    rules = [read_rule(dstate.claude_home() / "CLAUDE.md"), read_rule(steering),
-             read_rule(rejected_log_path()), read_rule(permissions_file),
+    rules = [read_rule(dstate.claude_home() / "CLAUDE.md"), read_rule(steering), read_rule(rejected_log_path()),
+             *([read_rule(permissions_file)] if permissions_file else []),
              read_rule(root / slug / MEMORY_DIRNAME, recursive=True)]
     rules += [read_rule(project_dir, recursive=True)] if project_dir else []
     command = build_claude_command(claude_executable(), options.model, options.budget_usd, run_dir, rules,

@@ -60,9 +60,11 @@ In Claude Code:
 
 If you haven't reviewed a project's last dream by the time the next one runs, the new dream doesn't pile up beside it. It starts its window at the oldest unreviewed run's start, so patterns that span several days count in full, and when it succeeds it **supersedes** those runs (status `superseded`, with `superseded_by` naming the new one; their worktrees and branches are removed). Changes you already accepted are live and rejected ones are in the rejection log, so neither comes back; anything still warranted is proposed again, and leftovers are not logged as rejected. A failed dream leaves the earlier runs alone. Turn it off with `to-dream config set rollup false`.
 
-### Permission suggestions
+### Permission suggestions (optional, off by default)
 
-Besides memory, a dream looks for calls that keep interrupting you. The digests tag four kinds of event:
+This is an opt-in feature. Turn it on with `to-dream config set permissions_review true`. While it is off (the default), the dream reads no settings files, writes no `permissions.md`, gets no permission instructions and its report has no `## Permission suggestions` section; the digests still carry the inline event tags below, but not the per-digest "Permission events" section or the `INDEX.md` table. The settings files stay denied to the dream either way.
+
+With it on, a dream looks for calls that keep interrupting you, besides memory. The digests tag four kinds of event:
 
 - **blocked**: Claude Code's auto-mode classifier refused the call (with its stated reason),
 - **approved after block**: the same call succeeded later, so you presumably approved it by hand,
@@ -121,7 +123,7 @@ The `to-dream` command (on the Bash tool's PATH while the plugin is enabled):
 | `sync-runtime [--force]` | Refresh the copy of the code used by scheduled jobs; never downgrades it unless `--force` |
 | `config show \| get KEY \| set KEY VALUE` | Read or change `config.json` |
 
-State lives in `$TO_DREAM_HOME` (see [Uninstall](#uninstall)). Config keys: `model`, `analyst_model`, `default_days`, `timeout_min`, `branch_template`, `worktree_dir`, `worktree_template`, `steering_path`, `schedule_time`, `update_check`, `rollup`.
+State lives in `$TO_DREAM_HOME` (see [Uninstall](#uninstall)). Config keys: `model`, `analyst_model`, `default_days`, `timeout_min`, `branch_template`, `worktree_dir`, `worktree_template`, `steering_path`, `schedule_time`, `update_check`, `rollup`, `permissions_review` (default false).
 
 ## Updating
 

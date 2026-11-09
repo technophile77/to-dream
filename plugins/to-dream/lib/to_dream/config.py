@@ -30,6 +30,7 @@ DEFAULTS: dict[str, Any] = {
     "schedule_time": "03:30",
     "update_check": True,
     "rollup": True,  # fold an unreviewed run's window into the next dream and supersede it
+    "permissions_review": False,  # opt in: suggest allow/ask permission rules from permission friction
 }
 
 TEMPLATE_FIELDS = ("run_id", "project", "yy", "mm", "dd", "hhmm")
@@ -147,6 +148,7 @@ _COERCERS: dict[str, Callable[[str, Any], Any]] = {
     "schedule_time": _schedule_time,
     "update_check": _boolean,
     "rollup": _boolean,
+    "permissions_review": _boolean,
 }
 
 
