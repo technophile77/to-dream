@@ -1,6 +1,6 @@
 {
   "name": "to-dream",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Out-of-band memory consolidation (\"dreaming\") for Claude Code auto memory: distils your session transcripts, finds repeated mistakes and stale memories, and proposes changes you review and accept.",
   "author": {
     "name": "Alex Cresswell"

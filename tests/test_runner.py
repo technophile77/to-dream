@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import time
 import unittest
@@ -7,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from unittest import mock
 
-from helpers import git, install_hook
+from helpers import git, install_hook, new_seed
 from to_dream_helpers import BASE_BRANCH, SEED_FILES, DreamTestCase
 
 from to_dream import config, gitops, runner, state as dstate
@@ -139,6 +140,13 @@ class PureHelperTests(unittest.TestCase):
         self.assertIn("--no-session-persistence", cmd)
         self.assertEqual(cmd[-2:], ["--add-dir", str(Path("/run"))])
 
+    def test_build_claude_command_appends_deny_rules_to_disallowed_tools(self):
+        deny = ["Read(//e/p/.claude/settings.json)", "Read(//e/p/.claude/settings.local.json)"]
+        cmd = runner.build_claude_command("claude", "opus", None, Path("/run"), ["Read(//e/p/**)"], deny)
+        j = cmd.index("--disallowedTools")
+        self.assertEqual(cmd[j + 1: cmd.index("--add-dir")], ["Bash", "PowerShell", "WebFetch", "WebSearch", *deny])
+        self.assertNotIn(deny[0], cmd[cmd.index("--allowedTools"): j])
+
     def test_no_budget_flag_unless_given(self):
         bare = runner.build_claude_command("claude", "opus", None, Path("/run"), [])
         self.assertNotIn("--max-budget-usd", bare)
@@ -182,22 +190,103 @@ class PureHelperTests(unittest.TestCase):
 
     def test_pick_extras_keyword_matching(self):
         sections = {"changes": "c", "stale_candidates_unverified": "s", "notes": "n",
-                    "patterns_noticed_but_not_acted_on": "p", "suggestions_for_global_claude_md": "g"}
-        self.assertEqual(runner.pick_extras(sections),
-                         {"global_suggestions": "g", "stale_candidates": "s", "not_acted_on": "p"})
-        self.assertEqual(runner.pick_extras({}), {"global_suggestions": "", "stale_candidates": "", "not_acted_on": ""})
+                    "patterns_noticed_but_not_acted_on": "p", "suggestions_for_global_claude_md": "g",
+                    "permission_suggestions": "perm"}
+        self.assertEqual(runner.pick_extras(sections), {
+            "global_suggestions": "g", "stale_candidates": "s", "not_acted_on": "p", "permission_suggestions": "perm"})
+        self.assertEqual(runner.pick_extras({}), {
+            "global_suggestions": "", "stale_candidates": "", "not_acted_on": "", "permission_suggestions": ""})
+
+    def test_global_and_permission_matchers_do_not_capture_each_other(self):
+        only_permission = runner.pick_extras({"permission_suggestions": "perm"})
+        self.assertEqual((only_permission["global_suggestions"], only_permission["permission_suggestions"]), ("", "perm"))
+        only_global = runner.pick_extras({"suggestions_for_global_claude_md": "g"})
+        self.assertEqual((only_global["global_suggestions"], only_global["permission_suggestions"]), ("g", ""))
+        mixed = runner.pick_extras({"global_permission_ideas": "x"})  # ambiguous: claimed by neither
+        self.assertEqual((mixed["global_suggestions"], mixed["permission_suggestions"]), ("", ""))
 
     def test_report_extras_match_the_headings_of_the_bundled_prompt(self):
         template = runner.ORCHESTRATOR_PROMPT.read_text(encoding="utf-8")
         headings = [h for h in re.findall(r"^## (.+?)\s*$", template, re.MULTILINE)
-                    if re.search(r"global|stale|not acted on", h, re.IGNORECASE)]
-        self.assertEqual(len(headings), 3, headings)  # the prompt must still define all three
+                    if re.search(r"global|stale|not acted on|permission", h, re.IGNORECASE)]
+        self.assertEqual(len(headings), 4, headings)  # the prompt must define all four
         report = "".join(f"## {h}\nbody of {i}\n\n" for i, h in enumerate(headings))
         extras = runner.pick_extras(gitops.level2_sections(report))
         by_heading = {h: f"body of {i}" for i, h in enumerate(headings)}
+        self.assertEqual(extras["permission_suggestions"],
+                         next(b for h, b in by_heading.items() if h.lower().startswith("permission")))
         self.assertEqual(extras["global_suggestions"], next(b for h, b in by_heading.items() if "global" in h.lower()))
         self.assertEqual(extras["stale_candidates"], next(b for h, b in by_heading.items() if h.lower().startswith("stale")))
         self.assertEqual(extras["not_acted_on"], next(b for h, b in by_heading.items() if "not acted on" in h.lower()))
+
+
+class RollupSelectionTests(unittest.TestCase):
+    """Pure selection of the runs a roll-up replaces, and the window it starts at."""
+
+    @staticmethod
+    def record(slug, kind, created="2026-11-01T00:00:00+00:00", since="2026-10-25T00:00:00+00:00"):
+        base = {"slug": slug, "created": created, "window_since": since, "commits": [{}, {}]}
+        extra = {
+            "fresh": {"status": "pending"},
+            "partial": {"status": "pending", "applied": {"x": "sha"}},
+            "all-applied": {"status": "pending", "applied": {"x": "1"}, "marked_applied": {"y": {}}},
+            "attention": {"status": "needs-attention", "commits": []},
+            "failed": {"status": "failed"}, "discarded": {"status": "discarded"},
+            "superseded": {"status": "superseded"}, "no-changes": {"status": "no-changes"},
+            "running": {"status": "running"},
+        }[kind]
+        return {**base, **extra}
+
+    def test_selects_pending_partial_and_needs_attention_of_the_project_oldest_first(self):
+        state = {"runs": {
+            "late": self.record("p", "fresh", created="2026-11-03T00:00:00+00:00"),
+            "early": self.record("p", "partial", created="2026-11-01T00:00:00+00:00"),
+            "mid": self.record("p", "attention", created="2026-11-02T00:00:00+00:00"),
+            "other-project": self.record("q", "fresh"),
+            "done": self.record("p", "all-applied"),
+            "bad": self.record("p", "failed"), "gone": self.record("p", "discarded"),
+            "old": self.record("p", "superseded"), "empty": self.record("p", "no-changes"),
+            "live": self.record("p", "running"),
+        }}
+        self.assertEqual([run_id for run_id, _ in runner.unreviewed_runs(state, "p")], ["early", "mid", "late"])
+        self.assertEqual(runner.unreviewed_runs({"runs": {}}, "p"), [])
+
+    def test_random_states_select_exactly_the_unreviewed_runs_of_the_project(self):
+        seed = new_seed()
+        print(f"[test_random_states_select_exactly_the_unreviewed_runs_of_the_project] seed={seed}")
+        rng = random.Random(seed)
+        kinds = ["fresh", "partial", "all-applied", "attention", "failed", "discarded", "superseded",
+                 "no-changes", "running"]
+        unreviewed_kinds = {"fresh", "partial", "attention"}
+        for trial in range(40):
+            runs, expected = {}, []
+            for n in range(rng.randint(0, 12)):
+                slug, kind = rng.choice(["p", "q"]), rng.choice(kinds)
+                created = f"2026-11-{rng.randint(1, 28):02d}T{rng.randint(0, 23):02d}:00:00+00:00"
+                runs[f"r{n}"] = self.record(slug, kind, created=created)
+                if slug == "p" and kind in unreviewed_kinds:
+                    expected.append((created, f"r{n}"))
+            with self.subTest(seed=seed, trial=trial):
+                chosen = runner.unreviewed_runs({"runs": runs}, "p")
+                self.assertEqual(sorted(r for r, _ in chosen), sorted(r for _, r in expected))
+                created_order = [rec["created"] for _, rec in chosen]
+                self.assertEqual(created_order, sorted(created_order))
+
+    def test_rollup_since_takes_the_earliest_start(self):
+        old = [("a", {"window_since": "2026-11-03T12:00:00+00:00"}),
+               ("b", {"window_since": "2026-11-01T06:00:00+00:00"}), ("c", {"window_since": "garbage"}), ("d", {})]
+        normal = datetime(2026, 11, 5, tzinfo=timezone.utc)
+        self.assertEqual(runner.rollup_since(normal, old), datetime(2026, 11, 1, 6, tzinfo=timezone.utc))
+        earlier = datetime(2026, 10, 20, tzinfo=timezone.utc)
+        self.assertEqual(runner.rollup_since(earlier, old), earlier)  # an explicit earlier --since still wins
+        self.assertEqual(runner.rollup_since(normal, []), normal)
+
+    def test_rollup_note(self):
+        self.assertEqual(runner.rollup_note([]), "This is not a roll-up.")
+        note = runner.rollup_note([("p-1", {"window_since": "S1", "window_until": "U1"}),
+                                   ("p-2", {"window_since": "S2", "window_until": "U2"})])
+        self.assertIn("p-1 (window S1 .. U1), p-2 (window S2 .. U2)", note)
+        self.assertIn("rejected log", note)
 
 
 class SlugResolutionTests(DreamTestCase):
@@ -320,6 +409,7 @@ class EndToEndTests(DreamTestCase):
         self.assertEqual(first["max_sessions"], 40)
         state = dstate.load_state()
         self.assertEqual(dstate.get_last_dream(state, self.slug), NOW.replace(microsecond=0))
+        config.set_value("rollup", False)  # roll-up has its own tests; here the plain chain is checked
         later = NOW + timedelta(days=1, minutes=5)
         runner.run_project(self.slug, runner.RunOptions(days=30), now=later, echo=False)
         self.assertEqual(self.distill.calls[1]["since"], NOW)  # last dream wins over --days
@@ -1001,6 +1091,33 @@ class RejectSuggestionTests(DreamTestCase):
         with self.assertRaises(runner.RunError):
             runner.reject_suggestion("nope", "x")
 
+    def test_permission_kind_is_logged_under_its_own_heading_with_the_rule(self):
+        summary = self.dream()
+        self.assertTrue(runner.reject_suggestion(
+            summary.run_id, "Bash(npm  test *)", "too broad", when=NOW, kind="permission"))
+        text = self.log_text()
+        self.assertIn(f"\n## 2026-11-02 | {self.slug} | permission suggestion\n", text)
+        self.assertIn("- Rule: Bash(npm test *)", text)
+        self.assertIn("- Reason: too broad", text)
+        self.assertNotIn("| global suggestion", text)
+        stored = runner.get_run(summary.run_id)["rejected_suggestions"]
+        self.assertEqual(stored[0]["kind"], "permission")
+
+    def test_dedupe_is_per_run_and_kind(self):
+        summary = self.dream()
+        self.assertTrue(runner.reject_suggestion(summary.run_id, "Do X", kind="permission"))
+        self.assertFalse(runner.reject_suggestion(summary.run_id, " Do   X", kind="permission"))
+        self.assertTrue(runner.reject_suggestion(summary.run_id, "Do X"))  # same words, other kind
+        self.assertFalse(runner.reject_suggestion(summary.run_id, "Do X", kind="global"))
+        self.assertEqual(self.log_text().count("| permission suggestion"), 1)
+        self.assertEqual(self.log_text().count("| global suggestion"), 1)
+
+    def test_unknown_kind_is_an_error_and_writes_nothing(self):
+        summary = self.dream()
+        with self.assertRaisesRegex(runner.RunError, "unknown suggestion kind"):
+            runner.reject_suggestion(summary.run_id, "x", kind="bogus")
+        self.assertEqual(self.log_text().count("\n## "), 0)
+
     def test_next_dream_is_pointed_at_the_log(self):
         summary = self.dream()
         runner.reject_suggestion(summary.run_id, "Always use tabs", "no")
@@ -1008,6 +1125,170 @@ class RejectSuggestionTests(DreamTestCase):
         runner.run_project(self.slug, runner.RunOptions(), now=NOW + timedelta(days=1), echo=False)
         self.assertIn((self.state_home / "rejected.md").as_posix(), self.claude_call()["stdin"])
         self.assertIn("Always use tabs", self.log_text())
+
+
+class RollupTests(DreamTestCase):
+    DAY = timedelta(days=1)
+
+    def dream(self, days=0, options=None, **plan):
+        self.plan(**(plan or HAPPY))
+        return runner.run_project(self.slug, options or runner.RunOptions(), now=NOW + days * self.DAY, echo=False)
+
+    def status(self, run_id):
+        return dstate.load_state()["runs"][run_id]["status"]
+
+    def rejected_text(self):
+        return (self.state_home / "rejected.md").read_text(encoding="utf-8")
+
+    def test_window_starts_at_the_unreviewed_runs_window(self):
+        first = self.dream()
+        second = self.dream(days=1)
+        self.assertEqual(self.distill.calls[0]["since"], NOW - timedelta(days=7))
+        self.assertEqual(self.distill.calls[1]["since"], NOW - timedelta(days=7))  # not NOW (the last dream)
+        self.assertEqual(self.distill.calls[1]["until"], NOW + self.DAY)
+        self.assertEqual(runner.get_run(second.run_id)["window_since"], "2026-10-26T18:30:12+00:00")
+        self.assertNotEqual(first.run_id, second.run_id)
+
+    def test_explicit_earlier_since_still_wins(self):
+        self.dream()
+        explicit = NOW - timedelta(days=20)
+        self.dream(days=1, options=runner.RunOptions(since=explicit))
+        self.assertEqual(self.distill.calls[1]["since"], explicit)
+
+    def test_success_supersedes_the_older_run_without_logging_rejections(self):
+        first = self.dream()
+        runner.apply_run(first.run_id, [3])  # topic.md is live
+        runner.reject_run(first.run_id, [2], "keep b.md")
+        before = self.rejected_text()
+        self.assertEqual(before.count("\n## "), 1)
+        second = self.dream(days=1)
+        self.assertEqual(second.superseded, (first.run_id,))
+        self.assertFalse(first.worktree.exists())
+        self.assertEqual(sorted(self.branches()), sorted([BASE_BRANCH, second.branch]))
+        record = runner.get_run(first.run_id)
+        self.assertEqual((record["status"], record["superseded_by"]), ("superseded", second.run_id))
+        self.assertEqual(self.rejected_text(), before)  # change 1 (never reviewed) is NOT logged as rejected
+        self.assertEqual((self.memory / "topic.md").read_text(), "prefers tabs\n")  # applied work stays live
+        self.assertIn(f"superseded {first.run_id}", (second.run_dir / "run.log").read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(runner.RunError, "superseded"):
+            runner.apply_run(first.run_id)
+        with self.assertRaisesRegex(runner.RunError, "superseded"):
+            runner.mark_applied(first.run_id, [1])
+
+    def test_prompt_carries_the_rollup_note(self):
+        first = self.dream()
+        self.assertIn("This is not a roll-up.", self.claude_call()["stdin"])
+        self.dream(days=1)
+        prompt = self.claude_call()["stdin"]
+        self.assertIn(f"replaces earlier unreviewed runs: {first.run_id} (window 2026-10-26T18:30:12+00:00 .. "
+                      "2026-11-02T18:30:12+00:00)", prompt)
+        self.assertNotIn("This is not a roll-up.", prompt)
+
+    def test_no_empty_result_also_supersedes(self):
+        first = self.dream()
+        second = self.dream(days=1, report="# nothing\n")
+        self.assertEqual(second.status, runner.STATUS_EMPTY)
+        self.assertEqual(second.superseded, (first.run_id,))
+        self.assertEqual(self.status(first.run_id), "superseded")
+        self.assertEqual(self.branches(), [BASE_BRANCH])
+
+    def test_failed_run_leaves_the_old_run_alone(self):
+        first = self.dream()
+        for label, plan in {"exit": dict(HAPPY, exit=3), "is_error": dict(HAPPY, is_error=True)}.items():
+            with self.subTest(label):
+                failed = self.dream(days=1, **plan)
+                self.assertEqual((failed.status, failed.superseded), (runner.STATUS_FAILED, ()))
+                self.assertEqual(self.status(first.run_id), "pending")
+                self.assertTrue(first.worktree.exists())
+                self.assertIn(first.branch, self.branches())
+        self.assertEqual(self.rejected_text().count("\n## "), 0)
+
+    def test_no_sessions_and_dry_run_leave_the_old_run_alone(self):
+        first = self.dream()
+        self.dream(days=1, options=runner.RunOptions(dry_run=True))
+        self.distill.count = 0
+        self.assertEqual(self.dream(days=2).status, runner.STATUS_NO_SESSIONS)
+        self.assertEqual(self.status(first.run_id), "pending")
+        self.assertTrue(first.worktree.exists())
+
+    def test_worktree_with_uncommitted_work_is_not_forced(self):
+        first = self.dream()
+        precious = first.worktree / self.slug / "memory" / "a.md"
+        precious.write_text("precious\n", newline="\n")
+        second = self.dream(days=1)
+        self.assertEqual(second.status, runner.STATUS_PENDING)
+        self.assertEqual(second.superseded, ())
+        self.assertEqual(self.status(first.run_id), "pending")
+        self.assertEqual(precious.read_text(), "precious\n")
+        self.assertIn(first.branch, self.branches())
+        self.assertTrue(any(first.run_id in w and "not superseded" in w for w in second.warnings), second.warnings)
+
+    def test_rollup_false_keeps_the_old_behaviour(self):
+        config.set_value("rollup", False)
+        first = self.dream()
+        second = self.dream(days=1)
+        self.assertEqual(self.distill.calls[1]["since"], NOW)  # the last dream, not the old window
+        self.assertEqual(second.superseded, ())
+        self.assertEqual(self.status(first.run_id), "pending")
+        self.assertTrue(first.worktree.exists())
+        self.assertIn("This is not a roll-up.", self.claude_call()["stdin"])
+
+    def test_fully_applied_run_is_not_rolled_up(self):
+        first = self.dream()
+        runner.apply_run(first.run_id)
+        second = self.dream(days=1, report="# nothing\n")
+        self.assertEqual(self.distill.calls[1]["since"], NOW)
+        self.assertEqual(second.superseded, ())
+        self.assertEqual(self.status(first.run_id), "pending")
+        self.assertIn(first.branch, self.branches())
+
+    def test_partially_applied_run_is_rolled_up(self):
+        first = self.dream()
+        runner.apply_run(first.run_id, [3])
+        self.assertEqual(runner.display_status(runner.get_run(first.run_id)), "partially-applied")
+        second = self.dream(days=1)
+        self.assertEqual(second.superseded, (first.run_id,))
+        self.assertEqual(self.distill.calls[1]["since"], NOW - timedelta(days=7))
+
+    def test_all_older_runs_are_superseded_and_the_earliest_window_is_used(self):
+        config.set_value("rollup", False)
+        first = self.dream()
+        second = self.dream(days=1)
+        config.set_value("rollup", True)
+        third = self.dream(days=2)
+        self.assertEqual(sorted(third.superseded), sorted([first.run_id, second.run_id]))
+        self.assertEqual(self.distill.calls[2]["since"], NOW - timedelta(days=7))
+        self.assertEqual([self.status(r) for r in (first.run_id, second.run_id)], ["superseded", "superseded"])
+        self.assertEqual({runner.get_run(r)["superseded_by"] for r in (first.run_id, second.run_id)}, {third.run_id})
+        self.assertEqual(sorted(self.branches()), sorted([BASE_BRANCH, third.branch]))
+
+    def test_a_protected_run_does_not_stop_the_others(self):
+        config.set_value("rollup", False)
+        first = self.dream()
+        second = self.dream(days=1)
+        config.set_value("rollup", True)
+        (first.worktree / self.slug / "memory" / "a.md").write_text("precious\n", newline="\n")
+        third = self.dream(days=2)
+        self.assertEqual(third.superseded, (second.run_id,))
+        self.assertEqual(self.status(first.run_id), "pending")
+        self.assertEqual(self.status(second.run_id), "superseded")
+
+    def test_discarding_a_superseded_run_does_not_log_rejections(self):
+        first = self.dream()
+        self.dream(days=1)
+        self.assertEqual(runner.discard_run(first.run_id), [])
+        self.assertEqual(self.rejected_text().count("\n## "), 0)
+        self.assertEqual(self.status(first.run_id), "discarded")
+
+
+class PlaceholderTests(unittest.TestCase):
+    def test_new_placeholders_are_known_and_in_the_bundled_inputs(self):
+        template = runner.ORCHESTRATOR_PROMPT.read_text(encoding="utf-8")
+        inputs = template.split("## Inputs")[1].split("## Safety rules")[0]
+        for name in ("rollup_note", "permissions_path"):
+            with self.subTest(name=name):
+                self.assertIn(name, runner.PLACEHOLDERS)
+                self.assertEqual(inputs.count("{{" + name + "}}"), 1)
 
 
 if __name__ == "__main__":

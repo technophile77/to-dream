@@ -2,6 +2,18 @@
 
 All notable changes to to-dream are recorded here. Versions follow [semver](https://semver.org/); the source of truth is `version` in `plugins/to-dream/.claude-plugin/plugin.json`.
 
+## 0.2.0 - 2026-11-09
+
+Roll-up and a permissions pass.
+
+- **Roll-up.** With the new config key `rollup` (default true), each project has at most one pending run: a new dream starts its window at the oldest unreviewed run's start and, on success, supersedes those runs (status `superseded`, `superseded_by` in `list --json` and `show --json`). Their leftover changes are not logged as rejected.
+- **Permission suggestions are optional and off by default.** The new config key `permissions_review` (default false; enable with `to-dream config set permissions_review true`) gates everything below except the inline digest tags and the settings read-deny rules: off, no `permissions.md` is written, the prompt carries no permission instructions, the digests omit the "Permission events" section and the `INDEX.md` table, and `permission_targets` is `{}`.
+- **Permission suggestions.** Digests now tag `BLOCKED` (auto-mode classifier refusals, with reason), `APPROVED-AFTER-BLOCK`, `INTERRUPTED` and `DENIED (user-rejected)` events, and `INDEX.md` ends with a per-call table. The dream reads a redacted `permissions.md` (only the `permissions` object of each settings file) and may add a `## Permission suggestions` section: `allow` rules for calls approved after a block at least twice, `ask` rules for calls interrupted at least twice (or once, then corrected).
+- `show --json` gains `report_extras.permission_suggestions`, `report_extras.permission_suggestions_parsed` and `permission_targets`. `reject-suggestion` gains `--kind global|permission`.
+- `/to-dream:review` reviews one project per pass (all of its runs, oldest first, skipping changes an earlier run already made), applies `MEMORY.md` changes in a separate command, and asks about each permission suggestion before adding it to the settings file you choose.
+- Security: the headless dream is now denied reading `settings.json` / `settings.local.json` of the project (and its git root) and `~/.claude/settings.json`, which can hold secrets in `env`.
+- Docs: `docs/DESIGN.md` lists the modules added since 0.1.0 and the `update_check` config key.
+
 ## 0.1.3 - 2026-11-03
 
 Fix: an older Claude Code session could overwrite the runtime with older code.

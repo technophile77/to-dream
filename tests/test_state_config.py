@@ -121,9 +121,19 @@ class ConfigTests(EnvCase):
         expected = {
             "model": "opus", "analyst_model": "sonnet", "default_days": 7, "timeout_min": 60,
             "branch_template": "dream/{run_id}", "worktree_dir": "", "worktree_template": "{run_id}",
-            "steering_path": "", "schedule_time": "03:30", "update_check": True,
+            "steering_path": "", "schedule_time": "03:30", "update_check": True, "rollup": True,
+            "permissions_review": False,
         }
         self.assertEqual(config.DEFAULTS, expected)
+
+    def test_permissions_review_is_off_by_default_and_coerces(self):
+        self.assertIs(config.get("permissions_review"), False)
+        for raw, stored in (("true", True), ("On", True), ("1", True), ("off", False), ("no", False), (True, True)):
+            with self.subTest(raw=raw):
+                self.assertIs(config.set_value("permissions_review", raw), stored)
+                self.assertIs(config.get("permissions_review"), stored)
+        with self.assertRaises(config.ConfigError):
+            config.set_value("permissions_review", "maybe")
 
     def test_load_returns_a_copy(self):
         config.load()["model"] = "changed"
@@ -138,6 +148,8 @@ class ConfigTests(EnvCase):
             ("update_check", "false", False),
             ("update_check", "ON", True),
             ("update_check", "0", False),
+            ("rollup", "off", False),
+            ("rollup", "Yes", True),
             ("schedule_time", "04:15", "04:15"),
             ("model", "  sonnet ", "sonnet"),
             ("branch_template", "feat/{project}-{yy}{mm}{dd}-{hhmm}", "feat/{project}-{yy}{mm}{dd}-{hhmm}"),
@@ -165,7 +177,7 @@ class ConfigTests(EnvCase):
             ("default_days", "0"), ("default_days", "-2"), ("default_days", "1.5"), ("default_days", "many"),
             ("default_days", True),
             ("timeout_min", "0"), ("timeout_min", "-5"), ("timeout_min", "soon"), ("timeout_min", "inf"),
-            ("update_check", "maybe"), ("schedule_time", "25:00"), ("schedule_time", "3:30"), ("schedule_time", "0330"),
+            ("update_check", "maybe"), ("rollup", "sometimes"), ("rollup", 2), ("schedule_time", "25:00"), ("schedule_time", "3:30"), ("schedule_time", "0330"),
             ("model", ""), ("model", "   "), ("model", 7),
             ("branch_template", "has space/{run_id}"), ("branch_template", "dream/{nope}"),
             ("branch_template", "a..b/{run_id}"), ("branch_template", "/lead/{run_id}"),

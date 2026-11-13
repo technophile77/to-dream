@@ -18,8 +18,8 @@ GH_TOKEN = "ghp_" + "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5"
 PASSWORD = "hunter2" + "hunter2"
 SECRETS = (GH_TOKEN, PASSWORD)
 BASE = datetime(2026, 11, 1, 9, 0, tzinfo=timezone.utc)
-ENTRY = re.compile(r"^- \[(\d\d:\d\d|--:--)\] L(\d+) (PROMPT|MEMORY-WRITE|ERROR|\*\*DENIED\*\*|\*\*CORRECTION\*\*) (.*)$")
-COUNTS = re.compile(r"^- counts: human_prompts=(\d+) corrections=(\d+) tool_errors=(\d+) denials=(\d+) memory_writes=(\d+)$", re.M)
+ENTRY = re.compile(r"^- \[(\d\d:\d\d|--:--)\] L(\d+) (PROMPT|MEMORY-WRITE|ERROR|\*\*DENIED\*\*|\*\*CORRECTION\*\*|\*\*BLOCKED\*\*|\*\*APPROVED-AFTER-BLOCK\*\*|\*\*INTERRUPTED\*\*) (.*)$")
+COUNTS = re.compile(r"^- counts: human_prompts=(\d+) corrections=(\d+) tool_errors=(\d+) denials=(\d+) memory_writes=(\d+) blocked=(\d+) approved_after_block=(\d+) interrupted=(\d+) rejected_at_prompt=(\d+)$", re.M)
 DROPPED = re.compile(r"^- dropped for size: (.*)$", re.M)
 
 
@@ -228,7 +228,8 @@ class DigestContentTests(DistillCase):
             tool_result("t4", "plain failure", minutes=7),
         ])
         self.assertEqual((digest.denials, digest.tool_errors), (2, 1))
-        self.assertEqual(tags_of(text), ["**DENIED**", "**DENIED**", "ERROR"])
+        # a no-kind "doesn't want to proceed" error is a user interrupt of an unprompted call
+        self.assertEqual(tags_of(text), ["**INTERRUPTED**", "**DENIED**", "ERROR"])
 
     def test_repeated_failures_section(self):
         records = [tool_use("a", "Bash", {"command": "make"}, 0)]
@@ -464,6 +465,271 @@ class FormatDriftStatsTests(DistillCase):
         self.assertFalse(stats.format_changed)
 
 
+CHROME = "mcp__chrome-devtools__get_network_request"
+INTERRUPT_TEXT = "The user doesn't want to proceed with this tool use. The tool use was rejected."
+PERMISSION_HEADER = ("| tool | input | blocked | approved after block | interrupted | interrupted then corrected "
+                     "| rejected at prompt | sessions | block reasons | approval modes | refs |")
+
+
+def blocked_result(tool_id, reason="Credential Materialization", minutes=None):
+    text = f"Permission for this action was denied by the Claude Code auto mode classifier. Reason: [{reason}]. Ask the user."
+    return tool_result(tool_id, text, minutes=minutes, toolDenialKind="automode-blocked")
+
+
+class PermissionEventTests(DistillCase):
+    def test_classify_result(self):
+        cases = [
+            (("anything", True, "automode-blocked"), "blocked"),
+            (("Permission for this action was denied by the Claude Code auto mode classifier. Reason: [X].", True), "blocked"),
+            ((INTERRUPT_TEXT, True, "user-rejected"), "rejected"),
+            ((INTERRUPT_TEXT, True), "interrupted"),
+            (("session ended before this call's result was recorded", True, "interrupted"), "error"),
+            (("rule matched", True, "permission-rule"), "denied"),
+            (("classifier down", True, "automode-unavailable"), "denied"),
+            (("PreToolUse hook error: blocked", True), "denied"),
+            (("boom", True), "error"),
+            (("fine", False), "ok"),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                self.assertEqual(distill.classify_result(*args), expected)
+
+    def test_classifier_reason(self):
+        self.assertEqual(distill.classifier_reason("x Reason: [Credential Materialization]. y"), "Credential Materialization")
+        self.assertEqual(distill.classifier_reason("no reason here"), "unspecified")
+
+    def test_block_then_success_is_approved_with_mode(self):
+        digest, text = self.run_one([
+            user("start", 0, permissionMode="auto"),
+            tool_use("t1", CHROME, {"reqid": 4}, 1),
+            blocked_result("t1", minutes=2),
+            user("manual permissions, do the read again", 3, permissionMode="acceptEdits"),
+            tool_use("t2", CHROME, {"reqid": 4}, 4),
+            tool_result("t2", "{...}", is_error=False, minutes=5),
+        ])
+        self.assertEqual((digest.blocked, digest.approved_after_block, digest.interrupted, digest.rejected_at_prompt), (1, 1, 0, 0))
+        self.assertEqual(digest.denials, 1)
+        permission_tags = [(e[1], e[2]) for e in entries_of(text) if e[2] in ("**BLOCKED**", "**APPROVED-AFTER-BLOCK**")]
+        self.assertEqual(permission_tags, [(3, "**BLOCKED**"), (6, "**APPROVED-AFTER-BLOCK**")])
+        self.assertIn(f"{CHROME} `reqid=4`: classifier [Credential Materialization]", text)
+        self.assertIn("(mode: acceptEdits)", text)
+        self.assertIn("counts: human_prompts=2 corrections=0 tool_errors=0 denials=1 memory_writes=0 blocked=1 "
+                      "approved_after_block=1 interrupted=0 rejected_at_prompt=0", text)
+        section = text.split("## Permission events")[1]
+        self.assertIn(f"- {CHROME} `reqid=4`: blocked 1 ([Credential Materialization]); "
+                      "approved after block 1 (mode: acceptEdits) - L3, L6", section)
+        event = digest.permission_events[1]
+        self.assertEqual((event.kind, event.permission_mode, event.line, event.session_id),
+                         ("approved_after_block", "acceptEdits", 6, "aaaaaaaa-1111"))
+
+    def test_approval_requires_same_tool_and_input_and_consumes_the_block(self):
+        digest, _ = self.run_one([
+            tool_use("t1", "Bash", {"command": "cat .env"}, 0), blocked_result("t1", minutes=1),
+            tool_use("t2", "Bash", {"command": "ls"}, 2), tool_result("t2", "a", is_error=False, minutes=3),
+            tool_use("t3", "Read", {"file_path": "x"}, 4), tool_result("t3", "a", is_error=False, minutes=5),
+            tool_use("t4", "Bash", {"command": "cat .env"}, 6), tool_result("t4", "ok", is_error=False, minutes=7),
+            tool_use("t5", "Bash", {"command": "cat .env"}, 8), tool_result("t5", "ok", is_error=False, minutes=9),
+        ])
+        self.assertEqual((digest.blocked, digest.approved_after_block), (1, 1))
+
+    def test_unknown_mode_is_reported_as_unknown(self):
+        digest, text = self.run_one([
+            tool_use("t1", "Bash", {"command": "x"}, 0), blocked_result("t1", minutes=1),
+            tool_use("t2", "Bash", {"command": "x"}, 2), tool_result("t2", "ok", is_error=False, minutes=3),
+        ])
+        self.assertIsNone(digest.permission_events[1].permission_mode)
+        self.assertIn("(mode: unknown)", text)
+
+    def test_block_never_retried(self):
+        digest, text = self.run_one([
+            tool_use("t1", "Bash", {"command": "curl x"}, 0), blocked_result("t1", "Exfiltration", 1),
+            tool_use("t2", "Bash", {"command": "other"}, 2), tool_result("t2", "ok", is_error=False, minutes=3),
+        ])
+        self.assertEqual((digest.blocked, digest.approved_after_block), (1, 0))
+        self.assertEqual(tags_of(text), ["**BLOCKED**"])
+        self.assertIn("blocked 1 ([Exfiltration]) - L2", text.split("## Permission events")[1])
+
+    def test_no_kind_rejection_is_an_interrupt(self):
+        digest, text = self.run_one([
+            tool_use("t1", "Bash", {"command": "sleep 99"}, 0),
+            user([{"type": "tool_result", "tool_use_id": "t1", "content": INTERRUPT_TEXT, "is_error": True},
+                  {"type": "text", "text": "[Request interrupted by user for tool use]"}], 1),
+        ])
+        self.assertEqual((digest.interrupted, digest.rejected_at_prompt, digest.denials, digest.human_prompts), (1, 0, 1, 0))
+        self.assertEqual(tags_of(text), ["**INTERRUPTED**"])
+        self.assertFalse(digest.permission_events[0].followed_by_correction)
+
+    def test_marker_in_a_separate_record_does_not_double_count(self):
+        digest, _ = self.run_one([
+            tool_use("t1", "Bash", {"command": "sleep 99"}, 0), tool_result("t1", INTERRUPT_TEXT, minutes=1),
+            user([{"type": "text", "text": "[Request interrupted by user for tool use]"}], 2),
+        ])
+        self.assertEqual((digest.interrupted, digest.human_prompts, digest.denials), (1, 0, 1))
+
+    def test_call_without_result_then_bare_marker_is_interrupted(self):
+        digest, text = self.run_one([
+            tool_use("t1", "Bash", {"command": "make"}, 0),
+            user([{"type": "text", "text": "[Request interrupted by user]"}], 1),
+        ])
+        self.assertEqual((digest.interrupted, digest.human_prompts, digest.denials), (1, 0, 1))
+        self.assertEqual([e[3] for e in entries_of(text)], ["Bash `make`: interrupted by user before any result"])
+
+    def test_bare_marker_without_open_call_is_ignored(self):
+        digest, _ = self.run_one([
+            tool_use("t1", "Bash", {"command": "make"}, 0), tool_result("t1", "ok", is_error=False, minutes=1),
+            user([{"type": "text", "text": "[Request interrupted by user]"}], 2),
+        ])
+        self.assertEqual((digest.interrupted, digest.human_prompts), (0, 0))
+
+    def test_user_rejected_is_rejected_at_prompt_not_interrupted(self):
+        digest, text = self.run_one([
+            tool_use("t1", "Bash", {"command": "rm x"}, 0),
+            tool_result("t1", INTERRUPT_TEXT, minutes=1, toolDenialKind="user-rejected"),
+        ])
+        self.assertEqual((digest.rejected_at_prompt, digest.interrupted, digest.denials), (1, 0, 1))
+        self.assertEqual(tags_of(text), ["**DENIED**"])
+        self.assertIn("Bash `rm x` (user-rejected):", text)
+        self.assertIn("rejected at prompt 1 - L2", text.split("## Permission events")[1])
+
+    def test_other_denial_kinds_show_their_kind(self):
+        digest, text = self.run_one([
+            tool_use("t1", "Bash", {"command": "git push"}, 0),
+            tool_result("t1", "Denied by a rule", minutes=1, toolDenialKind="permission-rule"),
+            tool_use("t2", "Bash", {"command": "ls"}, 2),
+            tool_result("t2", "classifier unavailable", minutes=3, toolDenialKind="automode-unavailable"),
+        ])
+        self.assertEqual((digest.denials, digest.tool_errors, digest.blocked, digest.interrupted, digest.rejected_at_prompt),
+                         (2, 0, 0, 0, 0))
+        self.assertEqual([e[3] for e in entries_of(text)],
+                         ["Bash `git push` (permission-rule): Denied by a rule",
+                          "Bash `ls` (automode-unavailable): classifier unavailable"])
+
+    def test_session_ended_interruption_is_not_a_user_interrupt(self):
+        digest, text = self.run_one([
+            tool_use("t1", "Bash", {"command": "make"}, 0),
+            tool_result("t1", "The session ended before this call's result was recorded", minutes=1,
+                        toolDenialKind="interrupted"),
+        ])
+        self.assertEqual((digest.interrupted, digest.denials, digest.tool_errors), (0, 0, 1))
+        self.assertEqual(tags_of(text), ["ERROR"])
+        self.assertEqual(digest.permission_events, ())
+
+    def test_interrupt_followed_by_correction(self):
+        digest, text = self.run_one([
+            tool_use("t1", "Bash", {"command": "deploy"}, 0), tool_result("t1", INTERRUPT_TEXT, minutes=1),
+            user("No, don't deploy yet", 2),
+            tool_use("t2", "Bash", {"command": "cleanup"}, 3), tool_result("t2", INTERRUPT_TEXT, minutes=4),
+            user("ok carry on", 5),
+            user("No, wrong", 6),  # a later correction is not "the next prompt"
+        ])
+        self.assertEqual([e.followed_by_correction for e in digest.permission_events], [True, False])
+        section = text.split("## Permission events")[1]
+        self.assertIn("Bash `deploy`: interrupted 1 (1 followed by a correction) - L2", section)
+        self.assertIn("Bash `cleanup`: interrupted 1 (0 followed by a correction) - L5", section)
+
+    def test_empty_section_says_none(self):
+        _, text = self.run_one([user("hi", 0)])
+        self.assertTrue(text.rstrip().endswith("## Permission events\n(none)"))
+
+    def test_trimming_keeps_permission_tags(self):
+        records = [user(f"plain prompt number {i} " + "w" * 300, i) for i in range(40)]
+        records += [tool_use("a", "Bash", {"command": "x"}, 50), blocked_result("a", minutes=51),
+                    tool_use("b", "Bash", {"command": "x"}, 52), tool_result("b", "ok", is_error=False, minutes=53),
+                    tool_use("c", "Bash", {"command": "y"}, 54), tool_result("c", INTERRUPT_TEXT, minutes=55)]
+        _, text = self.run_one(records, max_chars=3000)
+        self.assertLessEqual(len(text), 3000)
+        self.assertEqual(sorted(t for t in tags_of(text) if t != "PROMPT"),
+                         ["**APPROVED-AFTER-BLOCK**", "**BLOCKED**", "**INTERRUPTED**"])
+        self.assertIn("PROMPT=", DROPPED.search(text).group(1))
+
+    def test_secrets_in_permission_data_are_redacted(self):
+        digest, text = self.run_one([
+            user("x", 0, permissionMode="mode-" + GH_TOKEN),
+            tool_use("t1", "Bash", {"command": "curl -H 'Authorization: " + GH_TOKEN + "' h"}, 1),
+            blocked_result("t1", "Leak " + GH_TOKEN, 2),
+            tool_use("t2", "Bash", {"command": "curl -H 'Authorization: " + GH_TOKEN + "' h"}, 3),
+            tool_result("t2", "ok", is_error=False, minutes=4),
+        ])
+        self.assertEqual(digest.approved_after_block, 1)
+        index = distill.write_index([digest], self.out).read_text(encoding="utf-8")
+        for secret in SECRETS:
+            self.assertNotIn(secret, text)
+            self.assertNotIn(secret, index)
+            for event in digest.permission_events:
+                self.assertNotIn(secret, repr(event))
+
+    def test_permissions_review_off_drops_the_sections_but_keeps_inline_tags(self):
+        records = [
+            user("start", 0, permissionMode="auto"),
+            tool_use("t1", CHROME, {"reqid": 4}, 1),
+            blocked_result("t1", minutes=2),
+            user("manual permissions, do the read again", 3, permissionMode="acceptEdits"),
+            tool_use("t2", CHROME, {"reqid": 4}, 4),
+            tool_result("t2", "{...}", is_error=False, minutes=5),
+        ]
+        digest, text = self.run_one(records, permissions_review=False)
+        self.assertNotIn("## Permission events", text)
+        self.assertIn("## Repeated failures", text)
+        self.assertEqual([e[2] for e in entries_of(text) if e[2].startswith("**") and e[2] != "**CORRECTION**"],
+                         ["**BLOCKED**", "**APPROVED-AFTER-BLOCK**"])
+        self.assertEqual((digest.blocked, digest.approved_after_block, len(digest.permission_events)), (1, 1, 2))
+        index = distill.write_index([digest], self.out, permissions_review=False).read_text(encoding="utf-8")
+        self.assertNotIn("Permission events", index)
+        self.assertNotIn(distill.PERMISSION_TABLE_HEADER, index)
+        self.assertIn("**Totals:**", index)
+        with_review = distill.write_index([digest], self.out).read_text(encoding="utf-8")
+        self.assertIn("## Permission events (all sessions)", with_review)
+        self.assertIn(distill.PERMISSION_TABLE_HEADER, with_review)
+
+    def test_subagent_permission_events_are_digested(self):
+        path = write_jsonl(self.project / "bbbbbbbb-2222" / "subagents" / "agent-abcdef123456.jsonl", [
+            tool_use("t", "Bash", {"command": "cat .env"}, 0), blocked_result("t", minutes=1),
+        ])
+        digest = distill.distill_transcript(path, self.out, None, None, self.root)
+        self.assertEqual((digest.is_subagent, digest.blocked), (True, 1))
+        self.assertEqual(digest.permission_events[0].session_id, "bbbbbbbb-2222")
+
+    def test_index_aggregates_across_sessions(self):
+        write_jsonl(self.project / "aaaaaaaa-1111.jsonl", [
+            tool_use("t1", CHROME, {"reqid": 4}, 0), blocked_result("t1", "Credential Materialization", 1),
+            user("go on", 2, permissionMode="acceptEdits"),
+            tool_use("t2", CHROME, {"reqid": 4}, 3), tool_result("t2", "ok", is_error=False, minutes=4),
+            tool_use("t3", "Bash", {"command": "sleep 9"}, 5), tool_result("t3", INTERRUPT_TEXT, minutes=6),
+            user("no, stop that", 7),
+        ])
+        write_jsonl(self.project / "bbbbbbbb-2222.jsonl", [
+            tool_use("t1", CHROME, {"reqid": 4}, 100), blocked_result("t1", "Exfiltration", 101),
+            tool_use("t2", "Bash", {"command": "sleep 9"}, 102), tool_result("t2", INTERRUPT_TEXT, minutes=103),
+            tool_use("t3", "Bash", {"command": "sleep 9"}, 104), tool_result("t3", INTERRUPT_TEXT, minutes=105),
+            tool_use("t4", "Bash", {"command": "rm y"}, 106),
+            tool_result("t4", INTERRUPT_TEXT, minutes=107, toolDenialKind="user-rejected"),
+        ])
+        digests = distill.distill_project(self.project, self.out)
+        rows = distill.aggregate_permission_events(digests)
+        self.assertEqual([(r.tool, r.summary) for r in rows], [(CHROME, "reqid=4"), ("Bash", "sleep 9"), ("Bash", "rm y")])
+        chrome, sleep, rm = rows
+        self.assertEqual((chrome.blocked, chrome.approved_after_block, chrome.interrupted, chrome.sessions), (2, 1, 0, 2))
+        self.assertEqual(chrome.reasons, ("Exfiltration", "Credential Materialization"))  # newest digest first
+        self.assertEqual(chrome.modes, ("acceptEdits",))
+        self.assertEqual((sleep.blocked, sleep.interrupted, sleep.interrupted_then_corrected, sleep.sessions), (0, 3, 1, 2))
+        self.assertEqual((rm.rejected_at_prompt, rm.interrupted, rm.sessions), (1, 0, 1))
+        self.assertEqual(len(chrome.refs), 3)
+        text = distill.write_index(digests, self.out).read_text(encoding="utf-8")
+        section = text.split("## Permission events (all sessions)")[1].splitlines()
+        self.assertEqual(section[2], PERMISSION_HEADER)
+        self.assertTrue(section[4].startswith(
+            f"| {CHROME} | reqid=4 | 2 | 1 | 0 | 0 | 0 | 2 | Exfiltration, Credential Materialization | acceptEdits | "))
+        self.assertTrue(section[5].startswith("| Bash | sleep 9 | 0 | 0 | 3 | 1 | 0 | 2 |  |  | "))
+        self.assertIn("20261101-0900_aaaaaaaa.md L7", section[5])
+        self.assertIn("blocked=2, approved after block=1, interrupted=3, rejected at prompt=1", text)
+
+    def test_index_without_events_says_none(self):
+        digest, _ = self.run_one([user("hi", 0)])
+        text = distill.write_index([digest], self.out).read_text(encoding="utf-8")
+        self.assertTrue(text.rstrip().endswith("## Permission events (all sessions)\n\n(none)"))
+        self.assertEqual(distill.aggregate_permission_events([digest]), [])
+
+
 # ---------------------------------------------------------------- stochastic
 
 PLAIN = ["please add a unit test", "refactor the parser module", "looks good, ship it", "what does this function return",
@@ -474,9 +740,21 @@ DENIAL_TEXTS = ["The user doesn't want to proceed with this tool use.", "hook er
 ERROR_TEXTS = ["Command failed with exit code 1", "ENOENT: no such file {gh}", "traceback password: {pw}"]
 
 
+PERM_KEYS = [("mcp__x__y", {"q": 1}, "q=1"), ("mcp__x__y", {"q": 2}, "q=2"), ("mcp__z__w", {"q": 1}, "q=1")]
+BLOCK_TEXT = "Permission for this action was denied by the Claude Code auto mode classifier. Reason: [Credential Materialization]. Do not retry."
+
+
 class Expected:
     def __init__(self):
         self.prompts = self.corrections = self.errors = self.denials = self.memory = 0
+        self.blocked = self.approved = self.interrupted = self.rejected = 0
+        self.pending: Counter = Counter()
+        self.blocked_by_key: Counter = Counter()
+        self.approved_by_key: Counter = Counter()
+
+    def counts(self) -> tuple[int, ...]:
+        return (self.prompts, self.corrections, self.errors, self.denials, self.memory,
+                self.blocked, self.approved, self.interrupted, self.rejected)
 
 
 def gen_transcript(rng: random.Random, memory_dir: Path, count: int) -> tuple[list, Expected]:
@@ -486,7 +764,8 @@ def gen_transcript(rng: random.Random, memory_dir: Path, count: int) -> tuple[li
     for n in range(count):
         minute += rng.random() * 3
         ts = None if rng.random() < 0.15 else minute
-        kind = rng.choice(["prompt", "prompt", "fail", "fail", "deny", "ok", "memory", "noise", "assistant", "garbage"])
+        kind = rng.choice(["prompt", "prompt", "fail", "fail", "deny", "ok", "memory", "noise", "assistant", "garbage",
+                           "block", "block", "approve", "approve", "reject"])
         if kind == "prompt":
             bad = rng.random() < 0.4
             text = rng.choice(CORRECTING if bad else PLAIN).format(gh=GH_TOKEN, pw=PASSWORD)
@@ -501,10 +780,35 @@ def gen_transcript(rng: random.Random, memory_dir: Path, count: int) -> tuple[li
                 records.append(tool_result(tid, rng.choice(ERROR_TEXTS).format(gh=GH_TOKEN, pw=PASSWORD), minutes=None))
                 exp.errors += 1
             elif kind == "deny":
-                records.append(tool_result(tid, rng.choice(DENIAL_TEXTS), minutes=ts))
+                text = rng.choice(DENIAL_TEXTS)
+                records.append(tool_result(tid, text, minutes=ts))
                 exp.denials += 1
+                exp.interrupted += text.startswith("The user doesn't")  # no toolDenialKind: user stopped it
             else:
                 records.append(tool_result(tid, "all good", is_error=False))
+        elif kind in ("block", "approve"):
+            tool, tool_input, key = rng.choice(PERM_KEYS)
+            tid = f"p{n}"
+            records.append(tool_use(tid, tool, tool_input, ts))
+            if kind == "block":
+                records.append(tool_result(tid, BLOCK_TEXT, minutes=ts, toolDenialKind="automode-blocked"))
+                exp.blocked += 1
+                exp.denials += 1
+                exp.pending[(tool, key)] += 1
+                exp.blocked_by_key[(tool, key)] += 1
+            else:
+                records.append(tool_result(tid, "fine", is_error=False, minutes=ts, permissionMode=rng.choice(["auto", "plan"])))
+                if exp.pending[(tool, key)] > 0:  # a success after an unconsumed block is a manual approval
+                    exp.pending[(tool, key)] -= 1
+                    exp.approved += 1
+                    exp.approved_by_key[(tool, key)] += 1
+        elif kind == "reject":
+            tid = f"r{n}"
+            records.append(tool_use(tid, "Bash", {"command": "rm x"}, ts))
+            records.append(tool_result(tid, "The user doesn't want to proceed with this tool use.", minutes=ts,
+                                       toolDenialKind="user-rejected"))
+            exp.rejected += 1
+            exp.denials += 1
         elif kind == "memory":
             inside = rng.random() < 0.5
             target = memory_dir / "x.md" if inside else memory_dir.parent / "elsewhere.md"
@@ -554,14 +858,32 @@ class StochasticTests(DistillCase):
                 self.assertLessEqual(len(text), max_chars, ctx)
                 self.assertEqual(digest.chars, len(text), ctx)
                 if "[truncated]" not in text:  # a tiny budget can cut into the header (its source path is OS-specific)
-                    self.assertEqual(
-                        tuple(map(int, COUNTS.search(text).groups())),
-                        (exp.prompts, exp.corrections, exp.errors, exp.denials, exp.memory), ctx)
-                self.assertEqual((digest.human_prompts, digest.corrections, digest.tool_errors, digest.denials, digest.memory_writes),
-                                 (exp.prompts, exp.corrections, exp.errors, exp.denials, exp.memory), ctx)
+                    self.assertEqual(tuple(map(int, COUNTS.search(text).groups())), exp.counts(), ctx)
+                self.assertEqual(
+                    (digest.human_prompts, digest.corrections, digest.tool_errors, digest.denials, digest.memory_writes,
+                     digest.blocked, digest.approved_after_block, digest.interrupted, digest.rejected_at_prompt),
+                    exp.counts(), ctx)
+                self.check_permission_events(digest, exp, ctx)
                 for secret in SECRETS:
                     self.assertNotIn(secret, text, ctx)
                 self.check_entries(path, text, digest, max_chars > 100_000, ctx)
+
+    def check_permission_events(self, digest, exp, ctx):
+        events = digest.permission_events
+        kinds = Counter(e.kind for e in events)
+        self.assertEqual((kinds["blocked"], kinds["approved_after_block"], kinds["interrupted"], kinds["rejected_at_prompt"]),
+                         (exp.blocked, exp.approved, exp.interrupted, exp.rejected), ctx)
+        for key in exp.blocked_by_key:
+            tool, summary = key
+            blocked = sum(e.kind == "blocked" and (e.tool, e.summary) == key for e in events)
+            approved = sum(e.kind == "approved_after_block" and (e.tool, e.summary) == key for e in events)
+            self.assertEqual((blocked, approved), (exp.blocked_by_key[key], exp.approved_by_key[key]), f"{ctx} {key}")
+            self.assertLessEqual(approved, blocked, ctx)
+        text = digest.digest_path.read_text(encoding="utf-8")
+        if "[truncated]" not in text:
+            section = text.split("## Permission events")[1]
+            self.assertEqual(len([l for l in section.splitlines() if l.startswith("- ")]),
+                             len({(e.tool, e.summary) for e in events}), ctx)
 
     def check_entries(self, path, text, digest, expect_all, ctx):
         ts_by_line = effective_timestamps(path)
@@ -572,11 +894,17 @@ class StochasticTests(DistillCase):
         tags = Counter(tag for _, _, tag, _ in found)
         dropped = {k: int(v) for k, v in re.findall(r"([A-Z*-]+)=(\d+)", (DROPPED.search(text) or [None, ""])[1])}
         shown = {"prompts": tags["PROMPT"] + tags["**CORRECTION**"], "corrections": tags["**CORRECTION**"],
-                 "errors": tags["ERROR"], "denials": tags["**DENIED**"], "memory": tags["MEMORY-WRITE"]}
+                 "errors": tags["ERROR"], "memory": tags["MEMORY-WRITE"],
+                 "denials": tags["**DENIED**"] + tags["**BLOCKED**"] + tags["**INTERRUPTED**"],
+                 "blocked": tags["**BLOCKED**"], "approved": tags["**APPROVED-AFTER-BLOCK**"], "interrupted": tags["**INTERRUPTED**"]}
         lost = {"prompts": dropped.get("PROMPT", 0) + dropped.get("**CORRECTION**", 0), "corrections": dropped.get("**CORRECTION**", 0),
-                "errors": dropped.get("ERROR", 0), "denials": dropped.get("**DENIED**", 0), "memory": dropped.get("MEMORY-WRITE", 0)}
+                "errors": dropped.get("ERROR", 0), "memory": dropped.get("MEMORY-WRITE", 0),
+                "denials": dropped.get("**DENIED**", 0) + dropped.get("**BLOCKED**", 0) + dropped.get("**INTERRUPTED**", 0),
+                "blocked": dropped.get("**BLOCKED**", 0), "approved": dropped.get("**APPROVED-AFTER-BLOCK**", 0),
+                "interrupted": dropped.get("**INTERRUPTED**", 0)}
         total = {"prompts": digest.human_prompts, "corrections": digest.corrections, "errors": digest.tool_errors,
-                 "denials": digest.denials, "memory": digest.memory_writes}
+                 "denials": digest.denials, "memory": digest.memory_writes,
+                 "blocked": digest.blocked, "approved": digest.approved_after_block, "interrupted": digest.interrupted}
         if "[truncated]" not in text:
             for key in total:
                 self.assertEqual(shown[key] + lost[key], total[key], f"{ctx} {key}")

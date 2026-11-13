@@ -160,9 +160,12 @@ def add_run_parsers(sub) -> None:
     marked.add_argument("--note", default="", help="what you did (kept in state)")
     marked.set_defaults(func=cmd_mark_applied)
 
-    suggestion = sub.add_parser("reject-suggestion", help="log a rejected global CLAUDE.md suggestion")
+    suggestion = sub.add_parser("reject-suggestion",
+                                help="log a rejected global CLAUDE.md suggestion or permission rule")
     suggestion.add_argument("run_id")
-    suggestion.add_argument("--text", required=True, help="the suggestion that was turned down")
+    suggestion.add_argument("--text", required=True, help="the suggestion (or permission rule) that was turned down")
+    suggestion.add_argument("--kind", choices=runner.SUGGESTION_KINDS, default=runner.KIND_GLOBAL,
+                            help="global (CLAUDE.md suggestion, default) or permission (a rule)")
     suggestion.add_argument("--reason", default="", help="why (recorded in rejected.md)")
     suggestion.set_defaults(func=cmd_reject_suggestion)
 
@@ -243,6 +246,8 @@ def print_summary(summary: runner.RunSummary) -> None:
         print(f"  worktree: {summary.worktree}")
     for number, commit in enumerate(summary.commits, 1):
         print(f"  {number}. {commit.subject}" + (f" -- {commit.why}" if commit.why else ""))
+    if summary.superseded:
+        print(f"  superseded earlier unreviewed run(s): {', '.join(summary.superseded)}")
     for name, reason in summary.rejected:
         print(f"  NOT COMMITTED {name}: {reason.splitlines()[0]}")
     if summary.cost is not None:
@@ -387,10 +392,10 @@ def cmd_mark_applied(args: argparse.Namespace) -> int:
 
 
 def cmd_reject_suggestion(args: argparse.Namespace) -> int:
-    """Handle ``reject-suggestion``: log a turned-down global CLAUDE.md suggestion in ``rejected.md``."""
-    written = runner.reject_suggestion(args.run_id, args.text, args.reason)
+    """Handle ``reject-suggestion``: log a turned-down global CLAUDE.md suggestion or permission rule (``--kind``)."""
+    written = runner.reject_suggestion(args.run_id, args.text, args.reason, kind=args.kind)
     if written:
-        print(f"recorded the rejected global suggestion in {runner.rejected_log_path()}")
+        print(f"recorded the rejected {args.kind} suggestion in {runner.rejected_log_path()}")
     else:
         print("that suggestion was already recorded for this run")
     return 0
