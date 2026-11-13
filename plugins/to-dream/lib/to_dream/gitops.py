@@ -553,6 +553,19 @@ def merge_base(repo: Path, left: str, right: str) -> str:
     return run_git(repo, "merge-base", left, right).stdout.strip()
 
 
+def cherry_pick_one(repo: Path, sha: str) -> ApplyResult:
+    """Cherry-pick ``sha`` onto the branch checked out in ``repo`` (``-x`` records the origin).
+
+    On failure the pick is aborted (``git cherry-pick --abort``) so the repo is left clean and the
+    result has ``failed`` set to ``sha``; on success ``applied`` maps ``sha`` to the new commit.
+    """
+    result = run_git(repo, "cherry-pick", "-x", sha, check=False)
+    if result.returncode != 0:
+        run_git(repo, "cherry-pick", "--abort", check=False)
+        return ApplyResult({}, sha, (result.stderr.strip() or result.stdout.strip())[:500])
+    return ApplyResult({sha: rev_parse(repo, "HEAD")})
+
+
 def cherry_pick_all(repo: Path, shas: Iterable[str]) -> ApplyResult:
     """Cherry-pick ``shas`` in order onto the branch checked out in ``repo`` (``-x`` records the origin).
 
@@ -561,12 +574,10 @@ def cherry_pick_all(repo: Path, shas: Iterable[str]) -> ApplyResult:
     """
     applied: dict[str, str] = {}
     for sha in shas:
-        result = run_git(repo, "cherry-pick", "-x", sha, check=False)
-        if result.returncode != 0:
-            run_git(repo, "cherry-pick", "--abort", check=False)
-            message = (result.stderr.strip() or result.stdout.strip())[:500]
-            return ApplyResult(applied, sha, message)
-        applied[sha] = rev_parse(repo, "HEAD")
+        picked = cherry_pick_one(repo, sha)
+        if picked.failed:
+            return ApplyResult(applied, sha, picked.message)
+        applied.update(picked.applied)
     return ApplyResult(applied)
 
 
