@@ -2,6 +2,14 @@
 
 All notable changes to to-dream are recorded here. Versions follow [semver](https://semver.org/); the source of truth is `version` in `plugins/to-dream/.claude-plugin/plugin.json`.
 
+## 0.3.0 - 2026-11-13
+
+Cheaper reviews.
+
+- **`to-dream plan <run-id> [<run-id> ...] [--json]`.** One compact line per pending change (oldest run first) with the file, action, the report's Change line, `+added/-removed` line counts, `live_changed` (the live file differs from the version the run was based on), `applies_cleanly` (it would cherry-pick onto live memory now), `entrywise_ok` (a conflicting `MEMORY.md` change that `apply` can still re-apply) and `duplicate_of` (an earlier change in the given runs with the same file and the same added/removed lines). `/to-dream:review` reads it instead of raw `show --json`.
+- **`apply` re-applies a conflicting `MEMORY.md` change entry by entry.** Index lines are keyed by their link target: a replaced line is replaced in place, a new one is appended after the last index line, a removed one is deleted. It only stops, leaving the change pending and listing the entries, when an entry was edited (or is missing) in live `MEMORY.md`. Recorded as applied with `applied_entrywise` in the run's state.
+- `/to-dream:review` no longer applies `MEMORY.md` in a separate command; the by-hand fallback stays for reported entry conflicts.
+
 ## 0.2.0 - 2026-11-09
 
 Roll-up and a permissions pass.

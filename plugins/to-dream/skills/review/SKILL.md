@@ -28,17 +28,19 @@ Each pass reviews one project, so a project's runs are never split across passes
 
 ## 2. Load the proposals
 
-Run `to-dream show <run-id> --json` for each run of the project, oldest first. Then:
-- If the output has an `update_notice` (the nightly run found a newer release), show the same one-line update reminder as in step 0 using its `current` and `latest`, unless you already showed it.
+1. Run `to-dream plan <run-id> [<run-id> ...] --json` once with every run of the project. It lists the pending changes oldest run first (changes already `applied` or `rejected` are left out), and for each one: `run_id`, `n`, `file`, `action`, `change` (the report's **Change:** line), `added` and `removed` line counts, `live_changed`, `applies_cleanly`, `entrywise_ok` and `duplicate_of`. Use it for everything per-change; don't compute these yourself from raw diffs or `git log`.
+2. Run `to-dream show <run-id> --json` for each run, oldest first, only for what `plan` doesn't carry: `report_path`, `window_since` / `window_until`, `live_memory_dir`, `report_extras`, `permission_targets`, `update_notice` and each change's `diff` and `report_section` (the evidence and the preview).
+
+Then:
+- If the `show` output has an `update_notice` (the nightly run found a newer release), show the same one-line update reminder as in step 0 using its `current` and `latest`, unless you already showed it.
 - Tell the user, in 2–4 lines, which project, which time window (earliest `window_since` to latest `window_until`), how many runs and how many changes, followed by the report **Summary** bullets of the newest run. Read the bullets from `report_path`.
-- Skip changes already marked `applied` or `rejected`.
 
 ## 3. Ask about each change
 
 Go through the runs oldest first. Ask about up to 4 changes per AskUserQuestion call, one question per change. Each question has to make sense on its own, because the user may see only the dialog:
 
 - **header:** `#<n> <action>`, for example `#3 update`. With several runs, make it clear which run a change is from in the question.
-- **question:** `<file>: <the **Change:** line>. Evidence: <short version of **Evidence:**, e.g. "seen in 4 of 12 sessions">. Accept?`
+- **question:** `<file>: <the **Change:** line>. Evidence: <short version of **Evidence:**, e.g. "seen in 4 of 12 sessions">. Accept?` If `live_changed` is true, add a short warning before "Accept?", for example "The live file changed since this run, so applying it may overwrite newer content." If `applies_cleanly` is false, say it will conflict (for a `MEMORY.md` change with `entrywise_ok` true, say `apply` will re-apply it entry by entry instead).
 - **options:**
   1. `Accept`. Its `preview` is the diff, trimmed to its essential lines (at most about 40). For an `add`, show the new file. For a `delete`, show the file being removed.
   2. `Reject`. Its description is "Not applied. Future dreams won't propose it again without new evidence."
@@ -52,17 +54,18 @@ If the user writes a free-text answer under "Other", work out what they meant:
 
 Before asking about a large change, or one the user wants to look at more closely, show its full diff and report section in the chat.
 
-**Changes an earlier run already made.** Before asking about a change in a later run, check whether an earlier run in this review already made the same change (same file, same effect). If so, don't ask. Record it with `to-dream mark-applied <run-id> --only <n> --note "already applied by <earlier-run-id> change <m>"` and mention it to the user. If the earlier run's change was rejected, treat the later one as a conflict (below).
+**Changes an earlier run already made.** `plan` marks a change with `duplicate_of` (`run_id`, `n`, `status`) when an earlier change in this review has the same file and the same added and removed lines. If `duplicate_of` is set, don't ask separately: it follows the earlier change's decision.
+- If the earlier change is still pending, ask about the earlier one only, and when it's accepted, record the later one with `to-dream mark-applied <run-id> --only <n> --note "already applied by <earlier-run-id> change <m>"` once the earlier one is applied (rejected: reject the later one with the same reason).
+- If its `status` is `applied`, record it with that `mark-applied` command and mention it to the user.
+- If its `status` is `rejected`, treat the later change as a conflict (below).
 
 **Conflicts with earlier decisions.** If an accepted proposal contradicts something the user decided earlier (an entry in `rejected.md`, a change rejected in this review, or a memory they previously accepted, including one accepted from an earlier run in this pass), say so when you ask, for example "This conflicts with a change you rejected on <date>: <short summary>." If the user accepts it anyway, go ahead and note the reversal in the summary.
 
 ## 4. Apply the decisions
 
-Once every question in a batch is answered, apply that batch before asking about the next. `apply` cherry-picks in change-number order and stops at the first conflict, and `MEMORY.md` is the file most likely to conflict, so apply in two commands per run:
+Once every question in a batch is answered, apply that batch before asking about the next. `apply` cherry-picks in change-number order and stops at the first conflict. Apply each run's accepted changes (including "then edit") in one command: `to-dream apply <run-id> --only <n> [<n> ...]`
 
-1. **Accepted changes other than `MEMORY.md`** (including "then edit"), all in one command: `to-dream apply <run-id> --only <n> [<n> ...]`
-2. **Accepted `MEMORY.md` changes**, in a separate command: `to-dream apply <run-id> --only <n>`
-   - If it conflicts, the usual fix is to make the same index-line edits by hand on the live `MEMORY.md` (add, remove or edit the lines the change describes; read the change's diff). Offer that, then record it with `to-dream mark-applied <run-id> --only <n> --note "applied by hand"`.
+`apply` handles a conflicting `MEMORY.md` change itself: it re-applies the index lines entry by entry (replace, add, remove) and says so in its output (`re-applied entry by entry`). If it instead reports `MEMORY.md entry conflict` lines, an index entry was edited, or is missing, in the live `MEMORY.md` since the run, and the change stays pending. Show the user the conflicting entries and offer to make the change's index-line edits by hand on the live `MEMORY.md` (read the change's diff), then record it with `to-dream mark-applied <run-id> --only <n> --note "applied by hand"`. Changes after the stopped one in the same command were not applied; run `apply` again for them.
 
 For any other conflict, tell the user which change conflicted. Offer to make the same edit by hand on the live memory file, or to leave it. If the user chooses to fix it by hand: make the edit on the **live** memory file with the Edit tool, then record it with `to-dream mark-applied <run-id> --only <n> --note "applied by hand"`, so that `discard` doesn't log it as rejected.
 

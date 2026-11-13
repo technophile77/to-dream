@@ -1,6 +1,6 @@
-"""Command line for to-dream: ``to-dream <run|list|show|apply|reject|mark-applied|reject-suggestion|discard|config|...>``.
+"""Command line for to-dream: ``to-dream <run|list|show|plan|apply|reject|mark-applied|reject-suggestion|discard|config|...>``.
 
-Commands owned here: run, list, show, apply, reject, mark-applied, reject-suggestion, discard, config.
+Commands owned here: run, list, show, plan, apply, reject, mark-applied, reject-suggestion, discard, config.
 The modules ``doctor``, ``schedule``, ``update``, ``runtime`` and ``repo_setup`` contribute their own
 sub-commands through ``add_parser(subparsers)`` (registered lazily, so a missing module is skipped).
 
@@ -9,6 +9,7 @@ Example::
     to-dream run --project=. --dry-run
     to-dream run --project=-home-sam-proj      # POSIX slugs start with '-'; use the = form (a plain space also works)
     to-dream show proj-261102-1830 --diff
+    to-dream plan proj-261102-1830 proj-261109-0330 --json
     to-dream apply proj-261102-1830 --only 1 3
     to-dream reject proj-261102-1830 --only 2 --reason "too verbose"
 """
@@ -21,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from to_dream import config, gitops, runner, state as dstate
+from to_dream import config, gitops, review, runner, state as dstate
 
 COMMAND_PREFIX = "to-dream"
 VALUE_OPTIONS = ("--project",)  # options whose value may legitimately start with "-" (POSIX project slugs do)
@@ -113,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def add_run_parsers(sub) -> None:
-    """Add run, list, show, apply, reject, mark-applied, reject-suggestion, discard and config."""
+    """Add run, list, show, plan, apply, reject, mark-applied, reject-suggestion, discard and config."""
     run = sub.add_parser("run", help="distil sessions and propose memory changes on a branch")
     run.add_argument("--project", required=True, help="project slug, project path, or 'all'")
     window = run.add_mutually_exclusive_group()
@@ -142,7 +143,12 @@ def add_run_parsers(sub) -> None:
     form.add_argument("--json", action="store_true", help="machine-readable output (changes with diffs)")
     show.set_defaults(func=cmd_show)
 
-    apply = sub.add_parser("apply", help="snapshot, then cherry-pick dream commits onto live memory")
+    plan = sub.add_parser("plan", help="compact review summary of the pending changes of one or more runs")
+    plan.add_argument("run_ids", nargs="+", metavar="run_id", help="runs to summarise (reported oldest first)")
+    plan.add_argument("--json", action="store_true", help="machine-readable output")
+    plan.set_defaults(func=cmd_plan)
+
+    apply =sub.add_parser("apply", help="snapshot, then cherry-pick dream commits onto live memory")
     apply.add_argument("run_id")
     apply.add_argument("--only", type=int, nargs="+", metavar="N", help="commit numbers to apply")
     apply.add_argument("--force", action="store_true", help="also apply changes marked rejected")
@@ -353,6 +359,16 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Handle ``plan``: one line per pending change (file, +/- lines, live and conflict state, duplicates)."""
+    plan = review.build_plan(args.run_ids)
+    if args.json:
+        print_json(review.plan_to_json(plan))
+    else:
+        print(review.format_plan(plan))
+    return 0
+
+
 # --------------------------------------------------------------------------- review actions
 
 
@@ -369,10 +385,14 @@ def cmd_apply(args: argparse.Namespace) -> int:
     for number in report.skipped_rejected:
         print(f"commit {number} is marked rejected; skipped (use --only {number} --force to apply it)")
     print(f"applied {len(report.result.applied)} commit(s) to {gitops.current_branch(dstate.memory_root())}")
+    for number in report.entrywise:
+        print(f"commit {number} (MEMORY.md) conflicted; re-applied entry by entry")
     if report.result.failed:
         print(f"error: commit {report.result.failed[:10]} did not apply cleanly (cherry-pick aborted, live memory "
               f"unchanged by it). Review with `{COMMAND_PREFIX} show {args.run_id} --diff`; if you apply it by hand, "
               f"record it with `{COMMAND_PREFIX} mark-applied {args.run_id} --only N`.", file=sys.stderr)
+        for conflict in report.entry_conflicts:
+            print(f"  MEMORY.md entry conflict: {conflict}", file=sys.stderr)
         return 1
     return 0
 

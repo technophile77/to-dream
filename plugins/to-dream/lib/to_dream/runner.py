@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePath
 from typing import Any, Callable, Iterable
 
-from to_dream import config, gitops, permissions, state as dstate
+from to_dream import config, gitops, memory_index, permissions, state as dstate
 
 MEMORY_DIRNAME = "memory"
 REPORT_NAME = "DREAM_REPORT.md"
@@ -992,12 +992,19 @@ class RunChange:
 
 @dataclass(frozen=True)
 class ApplyReport:
-    """Outcome of :func:`apply_run`: the cherry-pick result, skipped change numbers and the snapshot made first."""
+    """Outcome of :func:`apply_run`: the cherry-pick result, skipped change numbers and the snapshot made first.
+
+    ``entrywise`` lists the change numbers of ``MEMORY.md`` changes that conflicted and were re-applied
+    entry by entry; ``entry_conflicts`` describes the index entries that stopped one (the change then
+    stays pending and is ``result.failed``).
+    """
 
     result: gitops.ApplyResult
     already_applied: list[int] = field(default_factory=list)
     skipped_rejected: list[int] = field(default_factory=list)
     snapshot: gitops.SnapshotResult | None = None
+    entrywise: list[int] = field(default_factory=list)
+    entry_conflicts: list[str] = field(default_factory=list)
 
 
 def run_changes(record: dict[str, Any]) -> list[RunChange]:
@@ -1167,13 +1174,44 @@ def mark_applied(
     return fresh
 
 
+def is_index_update(change: RunChange) -> bool:
+    """Say whether ``change`` edits the project's ``MEMORY.md`` index (the one file re-applied entry-wise)."""
+    return change.file == memory_index.INDEX_NAME and change.action == gitops.ACTION_UPDATE
+
+
+def pick_changes(root: Path, todo: list[RunChange]) -> tuple[gitops.ApplyResult, list[int], list[str]]:
+    """Cherry-pick ``todo`` in order; a conflicting ``MEMORY.md`` update is re-applied entry by entry.
+
+    Returns ``(result, entry-wise change numbers, entry conflicts)``. The first change that neither
+    cherry-picks nor re-applies stops the run (``result.failed``), and its entry conflicts are reported.
+    """
+    applied: dict[str, str] = {}
+    entrywise: list[int] = []
+    for change in todo:
+        picked = gitops.cherry_pick_one(root, change.sha)
+        if picked.failed and is_index_update(change):
+            outcome = memory_index.apply_entrywise(root, change.sha)
+            if outcome.sha:
+                applied[change.sha] = outcome.sha
+                entrywise.append(change.n)
+                continue
+            message = "; ".join(outcome.conflicts) or outcome.message or picked.message
+            return gitops.ApplyResult(applied, change.sha, message), entrywise, list(outcome.conflicts)
+        if picked.failed:
+            return gitops.ApplyResult(applied, change.sha, picked.message), entrywise, []
+        applied.update(picked.applied)
+    return gitops.ApplyResult(applied), entrywise, []
+
+
 def apply_run(run_id: str, only: list[int] | None = None, force: bool = False) -> ApplyReport:
     """Snapshot uncommitted memory, then cherry-pick a run's commits onto the live base branch.
 
     Already-applied (or marked-applied) changes are skipped. Rejected changes are skipped when applying
     everything, but naming one in ``only`` is refused unless ``force`` is set (which applies rejected ones
     too). The snapshot (``chore(to-dream): snapshot before apply <run-id>``) is only made when there is
-    something to pick. A conflict aborts the pick and is reported in ``result.failed``.
+    something to pick. A conflict aborts the pick and is reported in ``result.failed``, except that a
+    conflicting ``MEMORY.md`` update is re-applied entry by entry (see :mod:`to_dream.memory_index`) and
+    recorded as applied (``applied_entrywise`` in the run's state); only an entry conflict stops it.
 
     Raises:
         RunError: unknown/discarded run, a different branch than the run's base is checked out, tracked
@@ -1206,13 +1244,16 @@ def apply_run(run_id: str, only: list[int] | None = None, force: bool = False) -
     skipped_rejected = [] if force or only else rejected
     todo = [c for c in chosen if not c.applied and c.n not in skipped_rejected]
     snapshot = gitops.snapshot_memory(root, f"apply {run_id}") if todo else None
-    result = gitops.cherry_pick_all(root, [c.sha for c in todo])
+    result, entrywise, entry_conflicts = pick_changes(root, todo)
+    entrywise_shas = {c.sha: memory_index.ENTRYWISE_NOTE for c in todo if c.n in entrywise}
 
     def save(s: dict) -> None:
         s["runs"][run_id].setdefault("applied", {}).update(result.applied)
+        if entrywise_shas:
+            s["runs"][run_id].setdefault("applied_entrywise", {}).update(entrywise_shas)
 
     dstate.update_state(save)
-    return ApplyReport(result, [c.n for c in chosen if c.applied], skipped_rejected, snapshot)
+    return ApplyReport(result, [c.n for c in chosen if c.applied], skipped_rejected, snapshot, entrywise, entry_conflicts)
 
 
 def discard_run(run_id: str, force: bool = False) -> list[RunChange]:

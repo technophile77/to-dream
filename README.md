@@ -113,7 +113,8 @@ The `to-dream` command (on the Bash tool's PATH while the plugin is enabled):
 | `run --project=<slug\|path\|all> [--days N \| --since DATE] [--dry-run] [--model M] [--analyst-model M] [--budget-usd N] [--max-sessions N] [--timeout-min N]` | Run a dream. Write `--project=<value>` with `=`: on macOS and Linux slugs start with `-` (`-home-sam-proj`) |
 | `list [--json]` | List runs |
 | `show <run-id> [--json \| --diff]` | Show a run's proposed changes (`--json` adds the report extras, parsed permission suggestions and settings-file targets) |
-| `apply <run-id> [--only N ...] [--force]` | Cherry-pick accepted changes onto the live branch |
+| `plan <run-id> [<run-id> ...] [--json]` | Compact review summary of the pending changes (oldest run first): file, action, the report's Change line, `+added/-removed` lines, whether live memory changed since the run (`live_changed`), whether the change still applies (`applies_cleanly`) and whether an earlier change already made it (`duplicate_of`) |
+| `apply <run-id> [--only N ...] [--force]` | Cherry-pick accepted changes onto the live branch. A `MEMORY.md` change that conflicts is re-applied entry by entry (see DESIGN); only a conflicting entry stops it |
 | `reject <run-id> --only N ... [--reason TEXT]` | Reject changes and remember why |
 | `mark-applied <run-id> --only N ... [--note TEXT]` | Record a change you applied by hand |
 | `reject-suggestion <run-id> --text TEXT [--kind global\|permission] [--reason TEXT]` | Log a rejected CLAUDE.md suggestion (`global`, the default) or permission rule (`permission`) |
